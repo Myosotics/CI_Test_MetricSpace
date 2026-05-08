@@ -1833,71 +1833,10 @@ def train_conditional_realnvp(
     config: Optional[FlowTrainConfig] = None,
     x_val: Optional[torch.Tensor] = None,
     z_val: Optional[torch.Tensor] = None,
-) -> Dict[str, List[float]]:
+) -> Dict[str, object]:
     r"""
     Train a conditional RealNVP model via maximum likelihood estimation.
-
-    This function optimizes the model parameters to approximate the
-    conditional density p(x | z) by minimizing the negative log-likelihood (NLL)
-    on the training data. Optionally, validation data can be provided for
-    monitoring generalization performance and enabling early stopping.
-
-    Parameters
-    ----------
-    model : ConditionalRealNVP
-        The conditional normalizing flow model to be trained.
-
-    x_train : torch.Tensor, shape (n_samples, x_dim)
-        Training samples of the target variable.
-
-    z_train : torch.Tensor, shape (n_samples, z_dim)
-        Conditioning variables corresponding to ``x_train``.
-
-    config : FlowTrainConfig, default=FlowTrainConfig()
-        Training configuration containing optimization hyperparameters such as:
-            - number of epochs
-            - batch size
-            - learning rate
-            - weight decay
-            - gradient clipping
-            - learning rate scheduler
-            - verbosity
-
-    x_val : torch.Tensor, shape (n_val, x_dim), optional
-        Validation samples of the target variable.
-
-    z_val : torch.Tensor, shape (n_val, z_dim), optional
-        Validation conditioning variables corresponding to ``x_val``.
-
-    Returns
-    -------
-    history : Dict[str, List[float]]
-        Dictionary containing training history:
-            - "train_nll": list of training negative log-likelihood per epoch
-            - "val_nll"  : list of validation negative log-likelihood per epoch
-              (empty if validation data is not provided)
-
-    Raises
-    ------
-    TypeError
-        If input data are not torch tensors.
-
-    ValueError
-        If input tensors have invalid dimensions or incompatible shapes.
-
-    Notes
-    -----
-    - The model is trained using mini-batch stochastic gradient descent.
-    - The loss function is the negative log-likelihood:
-        NLL = -E[log p_theta(x | z)].
-    - If validation data is provided, early stopping is applied based on
-      validation NLL.
-    - The model parameters are automatically moved to the same device and dtype
-      as ``x_train``.
-    - At the end of training, the model is restored to the best-performing
-      parameters (according to validation NLL).
     """
-
     if config is None:
         config = FlowTrainConfig()
 
@@ -1926,13 +1865,6 @@ def train_conditional_realnvp(
 
     model.to(device=x_train.device, dtype=x_train.dtype)
 
-    # train_loader = DataLoader(
-    #     TensorDataset(x_train, z_train),
-    #     batch_size=config.batch_size,
-    #     shuffle=True,
-    #     drop_last=False,
-    # )
-
     optimizer = optim.Adam(
         model.parameters(),
         lr=config.lr,
@@ -1944,14 +1876,13 @@ def train_conditional_realnvp(
         gamma=config.scheduler_gamma,
     )
 
-    history: Dict[str, List[float]] = {
+    history: Dict[str, object] = {
         "train_nll": [],
         "val_nll": [],
+        "best_val": None,
+        "best_epoch": None,
     }
 
-    # ============================
-    # Early stopping parameters
-    # ============================
     patience = config.patience
     best_val = float("inf")
     best_state = None
@@ -1971,7 +1902,7 @@ def train_conditional_realnvp(
         for start in range(0, n_train, config.batch_size):
             end = min(start + config.batch_size, n_train)
             idx = perm[start:end]
-            
+
             xb = x_train[idx]
             zb = z_train[idx]
 
@@ -1999,18 +1930,13 @@ def train_conditional_realnvp(
         train_nll = running_loss / max(n_seen, 1)
         history["train_nll"].append(train_nll)
 
-        # ============================
-        # Validation
-        # ============================
         if x_val is not None and z_val is not None:
             model.eval()
             with torch.no_grad():
-                val_nll = float(
-                    (-model.log_prob(x_val, z_val).mean()).item()
-                )
+                val_nll = float((-model.log_prob(x_val, z_val).mean()).item())
+
             history["val_nll"].append(val_nll)
 
-            # Early stopping
             if val_nll < best_val:
                 best_val = val_nll
                 best_epoch = epoch + 1
@@ -2024,7 +1950,7 @@ def train_conditional_realnvp(
 
             if patience is not None and counter >= patience:
                 if config.verbose:
-                    print(f"Early stopping at epoch {epoch+1}")
+                    print(f"Early stopping at epoch {epoch + 1}")
                 break
 
         else:
@@ -2039,14 +1965,19 @@ def train_conditional_realnvp(
                     f"train_nll = {train_nll:.6f}, val_nll = {val_nll:.6f}"
                 )
 
-    # Restore best model parameters
     if best_state is not None:
         model.load_state_dict(best_state)
+        history["best_val"] = best_val
+        history["best_epoch"] = best_epoch
+
         if config.verbose:
             print(
                 f"Restored best model from epoch {best_epoch}, "
                 f"best_val = {best_val:.6f}"
             )
+    else:
+        history["best_val"] = None
+        history["best_epoch"] = None
 
     return history
 
