@@ -225,8 +225,7 @@ def spd_affine_invariant_distance_from_inv_half(
     atol: float = 1e-12,
 ) -> torch.Tensor:
     r"""
-    Compute affine-invariant SPD distances using the inverse square root
-    of the first argument.
+    Compute affine-invariant SPD distances from precomputed inverse square roots.
 
     Parameters
     ----------
@@ -235,14 +234,12 @@ def spd_affine_invariant_distance_from_inv_half(
 
         Shape:
         - ``(p, p)``, or
-        - ``(M, p, p)``
+        - ``(*batch_shape, p, p)``
 
     P2_matrix : torch.Tensor
         SPD matrices of the second argument.
 
-        Shape:
-        - ``(p, p)``, or
-        - ``(M, p, p)``
+        Must have the same shape as ``P1_inv_half``.
 
     atol : float, default=1e-12
         Lower bound applied to eigenvalues for numerical stability.
@@ -250,40 +247,34 @@ def spd_affine_invariant_distance_from_inv_half(
     Returns
     -------
     torch.Tensor
-        Distances of shape ``(M,)``.
-        If inputs are ``(p, p)``, returns shape ``(1,)``.
+        Affine-invariant distances.
+
+        Shape:
+        - ``(1,)`` if inputs are ``(p, p)``
+        - ``batch_shape`` if inputs are ``(*batch_shape, p, p)``
     """
-    # if P1_inv_half.shape != P2_matrix.shape:
-    #     raise ValueError(
-    #         f"Shape mismatch: P1_inv_half has shape {tuple(P1_inv_half.shape)} "
-    #         f"but P2_matrix has shape {tuple(P2_matrix.shape)}."
-    #     )
+    if P1_inv_half.shape != P2_matrix.shape:
+        raise ValueError(
+            f"Shape mismatch: P1_inv_half has shape {tuple(P1_inv_half.shape)}, "
+            f"but P2_matrix has shape {tuple(P2_matrix.shape)}."
+        )
 
     if P1_inv_half.ndim == 2:
         P1_inv_half = P1_inv_half.unsqueeze(0)
         P2_matrix = P2_matrix.unsqueeze(0)
 
-    # if P1_inv_half.ndim != 3:
-    #     raise ValueError("Inputs must have shape (p, p) or (M, p, p).")
+    p = P1_inv_half.shape[-1]
 
-    # if P1_inv_half.shape[-1] != P1_inv_half.shape[-2]:
-    #     raise ValueError(
-    #         f"Each matrix must be square, but got shape {tuple(P1_inv_half.shape)}."
-    #     )
+    A = P1_inv_half
+    B = P2_matrix
 
-    M_batch, p, _ = P1_inv_half.shape
-
-    A = P1_inv_half.contiguous()
-    B = P2_matrix.contiguous()
-
-    T = torch.bmm(A, B)
-    G = torch.bmm(T, A)
+    G = A @ B @ A
     G = 0.5 * (G + G.transpose(-1, -2))
 
     if p == 2:
-        a = G[:, 0, 0]
-        b = G[:, 0, 1]
-        c = G[:, 1, 1]
+        a = G[..., 0, 0]
+        b = G[..., 0, 1]
+        c = G[..., 1, 1]
 
         tr_half = 0.5 * (a + c)
         rad = torch.sqrt(
@@ -316,6 +307,80 @@ def spd_affine_invariant_distance(
 # ============================================================
 # 工具函数
 # ============================================================
+
+
+def broadcast_spd_pairs(
+    X: torch.Tensor,
+    mode: str,
+    rep: int | None = None,
+) -> torch.Tensor:
+    r"""
+    Broadcast batched matrices/tensors to a repeated pairwise-like structure
+    without materializing copies.
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        Input tensor of shape:
+
+        - ``(n, a, b)``, or
+        - ``(*batch_shape, n, a, b)``
+
+    mode : {"ij", "ji"}
+        Broadcasting pattern.
+
+        - ``"ij"``:
+          Each sample ``X_i`` is expanded along a new axis after ``n``.
+          The output satisfies:
+              out[..., i, j] = X[..., i]
+          Shape:
+              ``(*batch_shape, n, rep, a, b)``
+
+        - ``"ji"``:
+          The full batch is expanded along a new axis before ``n``.
+          The output satisfies:
+              out[..., i, j] = X[..., j]
+          Shape:
+              ``(*batch_shape, rep, n, a, b)``
+
+    rep : int or None, default=None
+        Number of repetitions along the broadcasted dimension.
+        If ``None``, defaults to ``n``.
+
+    Returns
+    -------
+    torch.Tensor
+        Broadcasted tensor:
+
+        - if ``mode="ij"``:
+            shape ``(*batch_shape, n, rep, a, b)``
+        - if ``mode="ji"``:
+            shape ``(*batch_shape, rep, n, a, b)``
+
+        The returned tensor is a view created via ``expand`` and
+        does not allocate new memory.
+    """
+
+    if X.ndim < 3:
+        raise ValueError("X must have shape (n, a, b) or (*batch_shape, n, a, b).")
+
+    *batch_shape, n, a, b = X.shape
+
+    if rep is None:
+        rep = n
+
+    if rep <= 0:
+        raise ValueError("rep must be a positive integer.")
+
+    if mode == "ij":
+        # (..., n, a, b) -> (..., n, 1, a, b) -> (..., n, rep, a, b)
+        return X.unsqueeze(-3).expand(*batch_shape, n, rep, a, b)
+
+    if mode == "ji":
+        # (..., n, a, b) -> (..., 1, n, a, b) -> (..., rep, n, a, b)
+        return X.unsqueeze(-4).expand(*batch_shape, rep, n, a, b)
+
+    raise ValueError("mode must be 'ij' or 'ji'")
 
 
 def delta_product(
@@ -398,12 +463,15 @@ def generate_data_spd(
     size: int = 2,
     rho: float = 0.0,
     seed: int | None = None,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float64,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""
-    Generate simulated SPD-valued samples ``(X, Y, Z)`` on GPU using PyTorch.
+    Generate simulated SPD-valued samples ``(X, Y, Z)`` using PyTorch.
 
-    This function only supports the SPD case. All outputs are returned as
-    CUDA torch tensors.
+    This function only supports the SPD case. The outputs are returned on
+    the specified device. If ``device`` is None, CUDA is used when available;
+    otherwise CPU is used.
 
     Parameters
     ----------
@@ -421,10 +489,18 @@ def generate_data_spd(
     seed : int or None, default=None
         Random seed.
 
+    device : torch.device or None, default=None
+        Device on which the samples are generated and returned. If None,
+        ``torch.device("cuda")`` is used when CUDA is available; otherwise
+        ``torch.device("cpu")`` is used.
+
+    dtype : torch.dtype, default=torch.float64
+        Floating-point dtype of the generated tensors.
+
     Returns
     -------
     X, Y, Z : tuple of torch.Tensor
-        CUDA tensors of shape ``(n, p, p)``.
+        Tensors of shape ``(n, p, p)`` stored on ``device`` with dtype ``dtype``.
 
     Notes
     -----
@@ -434,28 +510,27 @@ def generate_data_spd(
     matrix factors, and ``X, Y`` are formed by congruence transformations
     using the Cholesky factor of ``Z``.
     """
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available, but this function is set to use GPU only.")
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available.")
 
     if not (-1.0 <= rho <= 1.0):
         raise ValueError("rho must satisfy -1 <= rho <= 1.")
 
-    device = torch.device("cuda")
-    dtype = torch.float64
-
     if seed is not None:
         torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(seed)
 
     p = size
     nu = p + 6
     rho_comp = max(0.0, 1.0 - rho**2) ** 0.5
 
-    # Generate Z ~ Wishart(nu, I_p) / nu via Gaussian factors
     A = torch.randn(n, nu, p, device=device, dtype=dtype)
     Z = torch.matmul(A.transpose(-1, -2), A) / nu
 
-    # Generate correlated Gaussian matrix factors
     U = torch.randn(n, nu, p, device=device, dtype=dtype)
     V = torch.randn(n, nu, p, device=device, dtype=dtype)
     W = rho * U + rho_comp * V
@@ -463,14 +538,13 @@ def generate_data_spd(
     Sx = torch.matmul(U.transpose(-1, -2), U) / nu
     Sy = torch.matmul(W.transpose(-1, -2), W) / nu
 
-    # Cholesky factor of Z
     Z_half = torch.linalg.cholesky(Z)
 
-    # Congruence transforms
     X = Z_half @ Sx @ Z_half.transpose(-1, -2)
     Y = Z_half @ Sy @ Z_half.transpose(-1, -2)
 
     return X, Y, Z
+
 
 # ============================================================
 # SPD product-space empirical MDF (batched)
@@ -1046,6 +1120,91 @@ def statistics(
         total += float((diff * diff).sum().item())
 
     return total / (n * (n - 1))
+
+
+def statistics_fast(
+    Bundle_X: SPDDataBundle,
+    Bundle_Y: SPDDataBundle,
+    Bundle_Z: SPDDataBundle,
+    Bundle_X_orc: SPDDataBundle,
+    Bundle_Y_orc: SPDDataBundle,
+    atol: float = 1e-12,
+    batch_size: int = 1024,
+) -> float:
+    n = Bundle_X.matrix.shape[0]
+    M = Bundle_X_orc.matrix.shape[1]
+    device = Bundle_X.matrix.device
+    dtype = Bundle_X.matrix.dtype
+
+    d_x = spd_affine_invariant_distance_from_inv_half(
+        broadcast_spd_pairs(Bundle_X.inv_half, mode="ij"),
+        broadcast_spd_pairs(Bundle_X.matrix, mode="ji"),
+        atol=atol,
+    )
+
+    d_y = spd_affine_invariant_distance_from_inv_half(
+        broadcast_spd_pairs(Bundle_Y.inv_half, mode="ij"),
+        broadcast_spd_pairs(Bundle_Y.matrix, mode="ji"),
+        atol=atol,
+    )
+
+    d_z = spd_affine_invariant_distance_from_inv_half(
+        broadcast_spd_pairs(Bundle_Z.inv_half, mode="ij"),
+        broadcast_spd_pairs(Bundle_Z.matrix, mode="ji"),
+        atol=atol,
+    )
+
+    d_x_sim = spd_affine_invariant_distance_from_inv_half(
+        Bundle_X.inv_half[:, None, None, :, :].expand(n, n, M, -1, -1),
+        Bundle_X_orc.matrix[None, :, :, :, :].expand(n, n, M, -1, -1),
+        atol=atol,
+    )
+
+    d_y_sim = spd_affine_invariant_distance_from_inv_half(
+        Bundle_Y.inv_half[:, None, None, :, :].expand(n, n, M, -1, -1),
+        Bundle_Y_orc.matrix[None, :, :, :, :].expand(n, n, M, -1, -1),
+        atol=atol,
+    )
+
+    total_pairs = n * (n - 1)
+    total = 0.0
+
+    for start in range(0, total_pairs, batch_size):
+        end = min(start + batch_size, total_pairs)
+
+        k = torch.arange(start, end, device=device, dtype=torch.long)
+        ib = torch.div(k, n - 1, rounding_mode="floor")
+        r = torch.remainder(k, n - 1)
+        jb = r + (r >= ib).to(torch.long)
+
+        dx_ij = d_x[ib, jb]  # (B,)
+        dy_ij = d_y[ib, jb]
+        dz_ij = d_z[ib, jb]
+
+        emdf_P = (
+            (d_x[ib, :] <= dx_ij[:, None] + atol)
+            & (d_y[ib, :] <= dy_ij[:, None] + atol)
+            & (d_z[ib, :] <= dz_ij[:, None] + atol)
+        ).to(dtype).mean(dim=1)
+
+        tx = (
+            d_x_sim[ib, :, :] <= dx_ij[:, None, None] + atol
+        ).to(dtype).mean(dim=2)
+
+        ty = (
+            d_y_sim[ib, :, :] <= dy_ij[:, None, None] + atol
+        ).to(dtype).mean(dim=2)
+
+        dz = (
+            d_z[ib, :] <= dz_ij[:, None] + atol
+        ).to(dtype)
+
+        emdf_I = (tx * ty * dz).mean(dim=1)
+
+        diff = emdf_P - emdf_I
+        total += float((diff * diff).sum().item())
+
+    return total / total_pairs
 
 
 # ============================================================
