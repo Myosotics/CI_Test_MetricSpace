@@ -1,114 +1,400 @@
-from typing import Literal, Sequence, Union, Dict, List
+from typing import Literal, Union, Optional
 import numpy as np
 import torch
 from collections import defaultdict
+from dataclasses import dataclass
+
+
+ArrayLike = Union[np.ndarray, torch.Tensor]
+
+
+# ============================================================
+# Data bundle utilities
+# ------------------------------------------------------------
+# This section defines lightweight containers for metric-space data.
+#
+# Supported spaces:
+#   - Euclidean space;
+#   - unit sphere;
+#   - SPD manifold.
+#
+# BaseDataBundle stores ordinary array/tensor data for Euclidean and
+# spherical samples. SPDDataBundle stores SPD matrices and optional
+# precomputed quantities such as inverse square roots, eigendecompositions,
+# and Cholesky factors.
+#
+# Backend convention:
+#   - NumPy arrays remain NumPy arrays.
+#   - Torch tensors remain torch tensors on their existing device.
+# ============================================================
+
+
+class DataBundle:
+    r"""
+    Abstract base class for metric-space data bundles.
+
+    This class mainly provides a unified factory method
+    ``from_data`` and a common ``slice`` interface.
+    """
+
+    def slice(self, idx) -> "DataBundle":
+        r"""
+        Return a sliced data bundle along the leading sample dimension.
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def from_data(
+        X: ArrayLike,
+        space_type: str,
+        **kwargs,
+    ) -> "DataBundle":
+        r"""
+        Construct the appropriate data bundle from raw data.
+
+        Parameters
+        ----------
+        X : np.ndarray or torch.Tensor
+            Input data.
+
+        space_type : {"euclidean", "sphere", "spd"}
+            Metric space type.
+
+        **kwargs
+            Additional arguments passed to ``SPDDataBundle.from_matrix``
+            when ``space_type="spd"``.
+
+        Returns
+        -------
+        DataBundle
+            ``BaseDataBundle`` for Euclidean/sphere data, and
+            ``SPDDataBundle`` for SPD data.
+        """
+        if space_type == "spd":
+            return SPDDataBundle.from_matrix(X, **kwargs)
+
+        if space_type in {"euclidean", "sphere"}:
+            return BaseDataBundle(data=X, space_type=space_type)
+
+        raise ValueError("space_type must be one of {'euclidean', 'sphere', 'spd'}.")
+
+
+@dataclass
+class BaseDataBundle(DataBundle):
+    r"""
+    Data bundle for Euclidean or spherical samples.
+
+    Attributes
+    ----------
+    data : np.ndarray or torch.Tensor
+        Sample data.
+
+        Shape:
+        - ``(n, d)``
+        - or more generally ``(*batch_shape, d)``
+
+    space_type : {"euclidean", "sphere"}
+        Metric space type.
+    """
+
+    data: ArrayLike
+    space_type: str
+
+    def __post_init__(self):
+        r"""
+        Validate data type and supported space type.
+        """
+        if self.data is None:
+            raise ValueError("data must not be None.")
+
+        if not isinstance(self.data, (np.ndarray, torch.Tensor)):
+            raise TypeError("data must be np.ndarray or torch.Tensor.")
+
+        if self.space_type not in {"euclidean", "sphere"}:
+            raise ValueError("BaseDataBundle only supports euclidean or sphere.")
+
+    @property
+    def device(self):
+        r"""
+        Return the torch device, or ``"numpy"`` for NumPy arrays.
+        """
+        return self.data.device if isinstance(self.data, torch.Tensor) else "numpy"
+
+    @property
+    def dtype(self):
+        r"""
+        Return the dtype of the stored data.
+        """
+        return self.data.dtype
+
+    def slice(self, idx) -> "BaseDataBundle":
+        r"""
+        Slice the bundle along the leading dimension.
+        """
+        return BaseDataBundle(
+            data=self.data[idx],
+            space_type=self.space_type,
+        )
+
+
+@dataclass
+class SPDDataBundle(DataBundle):
+    r"""
+    Data bundle for SPD matrices with optional precomputed quantities.
+
+    Attributes
+    ----------
+    matrix : np.ndarray or torch.Tensor
+        SPD matrices.
+
+        Shape:
+        - ``(p, p)``
+        - ``(*batch_shape, p, p)``
+
+    inv_half : np.ndarray or torch.Tensor or None
+        Inverse square roots of SPD matrices.
+
+    eigvals : np.ndarray or torch.Tensor or None
+        Eigenvalues of SPD matrices.
+
+    eigvecs : np.ndarray or torch.Tensor or None
+        Eigenvectors of SPD matrices.
+
+    cholesky : np.ndarray or torch.Tensor or None
+        Cholesky factors of SPD matrices.
+
+    space_type : str, default="spd"
+        Must be ``"spd"``.
+    """
+
+    matrix: ArrayLike
+    inv_half: Optional[ArrayLike] = None
+    eigvals: Optional[ArrayLike] = None
+    eigvecs: Optional[ArrayLike] = None
+    cholesky: Optional[ArrayLike] = None
+    space_type: str = "spd"
+
+    def __post_init__(self):
+        r"""
+        Validate matrix type, shape, and space type.
+        """
+        if self.matrix is None:
+            raise ValueError("matrix must not be None.")
+
+        if not isinstance(self.matrix, (np.ndarray, torch.Tensor)):
+            raise TypeError("matrix must be np.ndarray or torch.Tensor.")
+
+        if self.matrix.ndim < 2:
+            raise ValueError("matrix must have shape (p, p) or (*batch_shape, p, p).")
+
+        if self.matrix.shape[-1] != self.matrix.shape[-2]:
+            raise ValueError(f"SPD matrices must be square, got {self.matrix.shape}.")
+
+        if self.space_type != "spd":
+            raise ValueError("SPDDataBundle only supports space_type='spd'.")
+
+    @property
+    def data(self) -> ArrayLike:
+        r"""
+        Alias for ``matrix`` to match the generic DataBundle interface.
+        """
+        return self.matrix
+
+    @property
+    def device(self):
+        r"""
+        Return the torch device, or ``"numpy"`` for NumPy arrays.
+        """
+        return self.matrix.device if isinstance(self.matrix, torch.Tensor) else "numpy"
+
+    @property
+    def dtype(self):
+        r"""
+        Return the dtype of the stored SPD matrices.
+        """
+        return self.matrix.dtype
+
+    @classmethod
+    def from_matrix(
+        cls,
+        X: ArrayLike,
+        atol: float = 1e-12,
+        compute_eig: bool = True,
+        compute_inv_half: bool = True,
+        compute_cholesky: bool = True,
+    ) -> "SPDDataBundle":
+        r"""
+        Construct an SPD bundle from raw SPD matrices.
+
+        Parameters
+        ----------
+        X : np.ndarray or torch.Tensor
+            SPD matrices with shape ``(p, p)`` or ``(*batch_shape, p, p)``.
+
+        atol : float, default=1e-12
+            Lower bound used when clamping eigenvalues.
+
+        compute_eig : bool, default=True
+            Whether to compute eigenvalues and eigenvectors.
+
+        compute_inv_half : bool, default=True
+            Whether to compute inverse square roots. Requires ``compute_eig=True``.
+
+        compute_cholesky : bool, default=True
+            Whether to compute Cholesky factors.
+
+        Returns
+        -------
+        SPDDataBundle
+            Bundle containing ``X`` and requested precomputed quantities.
+        """
+        if not compute_eig:
+            compute_inv_half = False
+
+        eigvals = None
+        eigvecs = None
+        inv_half = None
+        cholesky = None
+
+        if isinstance(X, torch.Tensor):
+            if compute_eig:
+                eigvals, eigvecs = torch.linalg.eigh(X)
+                eigvals = torch.clamp(eigvals, min=atol)
+
+                if compute_inv_half:
+                    inv_sqrt = 1.0 / torch.sqrt(eigvals)
+                    inv_half = torch.matmul(
+                        eigvecs * inv_sqrt[..., None, :],
+                        eigvecs.transpose(-1, -2),
+                    )
+
+            if compute_cholesky:
+                cholesky = torch.linalg.cholesky(X)
+
+        elif isinstance(X, np.ndarray):
+            if compute_eig:
+                eigvals, eigvecs = np.linalg.eigh(X)
+                eigvals = np.clip(eigvals, atol, None)
+
+                if compute_inv_half:
+                    inv_sqrt = 1.0 / np.sqrt(eigvals)
+                    inv_half = np.matmul(
+                        eigvecs * inv_sqrt[..., None, :],
+                        np.swapaxes(eigvecs, -1, -2),
+                    )
+
+            if compute_cholesky:
+                cholesky = np.linalg.cholesky(X)
+
+        else:
+            raise TypeError("X must be np.ndarray or torch.Tensor.")
+
+        return cls(
+            matrix=X,
+            inv_half=inv_half,
+            eigvals=eigvals,
+            eigvecs=eigvecs,
+            cholesky=cholesky,
+        )
+
+    def slice(self, idx) -> "SPDDataBundle":
+        r"""
+        Slice all non-None SPD bundle fields along the leading dimension.
+        """
+        return SPDDataBundle(
+            matrix=self.matrix[idx],
+            inv_half=None if self.inv_half is None else self.inv_half[idx],
+            eigvals=None if self.eigvals is None else self.eigvals[idx],
+            eigvecs=None if self.eigvecs is None else self.eigvecs[idx],
+            cholesky=None if self.cholesky is None else self.cholesky[idx],
+            space_type=self.space_type,
+        )
 
 
 # ============================================================
 # Distance functions on a single metric space
 # ------------------------------------------------------------
-# This section implements distance functions for the metric spaces
-# considered in the paper:
+# This section implements matched-sample distance functions for
+# the metric spaces used in the simulations:
 #   - Euclidean space;
-#   - the unit sphere with geodesic distance;
-#   - the space of symmetric positive definite matrices equipped
-#     with the Cholesky distance.
+#   - unit sphere;
+#   - SPD manifold with affine-invariant distance.
 #
-# A unified dispatcher is also provided through ``compute_distance``.
-#
-# Backend convention:
-#   * If GPU=False, computations are carried out with NumPy on CPU.
-#   * If GPU=True, computations are carried out with PyTorch on CUDA.
-#
-# Throughout, strict shape matching is imposed and no broadcasting
-# is performed.
+# Inputs must have matching shapes and matching backends.
+# NumPy inputs return NumPy outputs; torch inputs return torch outputs.
 # ============================================================
 
 
 def euclidean_distance(
-    x: Union[np.ndarray, torch.Tensor],
-    y: Union[np.ndarray, torch.Tensor],
-    GPU: bool = False,
+    x: ArrayLike,
+    y: ArrayLike,
 ) -> Union[float, np.ndarray, torch.Tensor]:
     r"""
-    Compute Euclidean distances under strict shape matching.
-
-    This function supports two input regimes:
-    (i) a single-pair query, where ``x`` and ``y`` are one-dimensional
-    arrays/tensors of the same shape, and
-    (ii) a batched query, where ``x`` and ``y`` are two-dimensional
-    arrays/tensors of the same shape and the distance is computed row-wise.
-
-    No broadcasting is allowed. In particular, the shapes of ``x`` and ``y``
-    must coincide exactly.
+    Compute Euclidean distances between matched inputs.
 
     Parameters
     ----------
     x, y : np.ndarray or torch.Tensor
-        Input points or batches of points.
+        Inputs with identical shape.
 
-        - If ``GPU=False``, then ``x`` and ``y`` are assumed to be NumPy arrays.
-        - If ``GPU=True``, then ``x`` and ``y`` are assumed to be CUDA torch
-          tensors.
-
-        Supported shapes are:
-
-        - ``(d,)`` for a single query;
-        - ``(M, d)`` for a batch of ``M`` matched queries.
-
-    GPU : bool, default=False
-        Indicator of the computational backend. If ``False``, the computation
-        is carried out with NumPy on CPU. If ``True``, the computation is
-        carried out with PyTorch on CUDA.
+        Supported shapes:
+        - ``(d,)``
+        - ``(*batch_shape, d)``
 
     Returns
     -------
     float or np.ndarray or torch.Tensor
-        The Euclidean distance(s).
+        Euclidean distance.
 
-        - If ``x.shape == y.shape == (d,)``, returns a scalar ``float``.
-        - If ``x.shape == y.shape == (M, d)``, returns a one-dimensional object
-          of length ``M``:
-            * a NumPy array when ``GPU=False``;
-            * a torch tensor when ``GPU=True``.
-
-    Raises
-    ------
-    ValueError
-        If ``x`` and ``y`` do not have the same number of dimensions, do not
-        have identical shapes, or are not one- or two-dimensional.
-
-    Notes
-    -----
-    This routine assumes that the input types are already consistent with the
-    selected backend. In particular, no implicit conversion between NumPy arrays
-    and torch tensors is performed inside the function.
+        - Shape ``(d,)`` returns ``float``.
+        - Shape ``(*batch_shape, d)`` returns ``(*batch_shape,)``.
     """
-    if x.ndim != y.ndim:
-        raise ValueError("x and y must have the same number of dimensions.")
+    if type(x) is not type(y):
+        raise TypeError(
+            "x and y must use the same backend."
+        )
+
+    if not isinstance(x, (np.ndarray, torch.Tensor)):
+        raise TypeError(
+            "x and y must be np.ndarray or torch.Tensor."
+        )
 
     if x.shape != y.shape:
         raise ValueError(
-            f"x and y must have identical shapes, but got "
-            f"{tuple(x.shape)} and {tuple(y.shape)}."
+            f"Shape mismatch: {tuple(x.shape)} vs {tuple(y.shape)}."
         )
 
-    if not GPU:
+    if x.ndim < 1:
+        raise ValueError(
+            "Inputs must have shape (d,) or (*batch_shape, d)."
+        )
+
+    # ============================================================
+    # NumPy backend
+    # ============================================================
+    if isinstance(x, np.ndarray):
+        out = np.linalg.norm(x - y, axis=-1)
         if x.ndim == 1:
-            return float(np.linalg.norm(x - y))
+            return float(out.item())
+        return out
 
-        if x.ndim == 2:
-            return np.linalg.norm(x - y, axis=1)
-
-        raise ValueError("Inputs must be either one- or two-dimensional.")
-
+    # ============================================================
+    # Torch backend
+    # ============================================================
+    if x.device != y.device:
+        raise ValueError(
+            f"Device mismatch: "
+            f"x.device={x.device}, y.device={y.device}."
+        )
+    if x.dtype != y.dtype:
+        raise ValueError(
+            f"Dtype mismatch: "
+            f"x.dtype={x.dtype}, y.dtype={y.dtype}."
+        )
+    out = torch.linalg.norm(x - y, dim=-1)
     if x.ndim == 1:
-        return float(torch.linalg.norm(x - y).item())
-
-    if x.ndim == 2:
-        return torch.linalg.norm(x - y, dim=1)
-
-    raise ValueError("Inputs must be either one- or two-dimensional.")
+        return float(out.item())
+    return out
 
 
 def sphere_geodesic_distance(
@@ -215,64 +501,27 @@ def spd_cholesky_distance(
     GPU: bool = False,
 ) -> Union[float, np.ndarray, torch.Tensor]:
     r"""
-    Compute the Cholesky distance for symmetric positive definite matrices
-    under strict shape matching.
-
-    This function supports two input regimes:
-    (i) a single-pair query, where ``P1`` and ``P2`` are two-dimensional
-    arrays/tensors of the same shape, and
-    (ii) a batched query, where ``P1`` and ``P2`` are three-dimensional
-    arrays/tensors of the same shape and the distance is computed entry-wise
-    across the batch.
-
-    No broadcasting is allowed. In particular, the shapes of ``P1`` and ``P2``
-    must coincide exactly.
+    Compute Cholesky distances between matched SPD matrices.
 
     Parameters
     ----------
     P1, P2 : np.ndarray or torch.Tensor
-        Input SPD matrices or batches of SPD matrices.
+        SPD matrices with identical shape.
 
-        - If ``GPU=False``, then ``P1`` and ``P2`` are assumed to be NumPy arrays.
-        - If ``GPU=True``, then ``P1`` and ``P2`` are assumed to be CUDA torch
-          tensors.
-
-        Supported shapes are:
-
-        - ``(p, p)`` for a single query;
-        - ``(M, p, p)`` for a batch of ``M`` matched queries.
+        Supported shapes:
+        - ``(p, p)``
+        - ``(M, p, p)``
 
     GPU : bool, default=False
-        Indicator of the computational backend. If ``False``, the computation
-        is carried out with NumPy on CPU. If ``True``, the computation is
-        carried out with PyTorch on CUDA.
+        Legacy backend flag.
 
     Returns
     -------
     float or np.ndarray or torch.Tensor
-        The Cholesky distance(s), defined as the Frobenius norm of the
-        difference between the Cholesky factors.
+        Cholesky distance.
 
-        - If ``P1.shape == P2.shape == (p, p)``, returns a scalar ``float``.
-        - If ``P1.shape == P2.shape == (M, p, p)``, returns a one-dimensional
-          object of length ``M``:
-            * a NumPy array when ``GPU=False``;
-            * a torch tensor when ``GPU=True``.
-
-    Raises
-    ------
-    ValueError
-        If ``P1`` and ``P2`` do not have identical shapes, are not two- or
-        three-dimensional, or do not represent square matrices.
-
-    Notes
-    -----
-    This routine assumes that the input types are already consistent with the
-    selected backend. In particular, no implicit conversion between NumPy arrays
-    and torch tensors is performed inside the function.
-
-    It is also assumed that all input matrices are symmetric positive definite,
-    so that their Cholesky factors are well defined.
+        - Shape ``(p, p)`` returns ``float``.
+        - Shape ``(M, p, p)`` returns ``(M,)``.
     """
     if P1.shape != P2.shape:
         raise ValueError(
@@ -327,883 +576,352 @@ def spd_cholesky_distance(
 
 
 def spd_affine_invariant_distance(
-    P1: Union[np.ndarray, torch.Tensor],
-    P2: Union[np.ndarray, torch.Tensor],
+    P1_inv_half: ArrayLike,
+    P2_matrix: ArrayLike,
     atol: float = 1e-12,
-    GPU: bool = False,
 ) -> Union[float, np.ndarray, torch.Tensor]:
     r"""
-    Compute the affine-invariant Riemannian distance for symmetric positive
-    definite (SPD) matrices under strict shape matching.
-
-    This function supports two input regimes:
-    (i) a single-pair query, where ``P1`` and ``P2`` are two-dimensional
-    arrays/tensors of the same shape, and
-    (ii) a batched query, where ``P1`` and ``P2`` are three-dimensional
-    arrays/tensors of the same shape and the distance is computed entry-wise
-    across the batch.
-
-    No broadcasting is allowed. In particular, the shapes of ``P1`` and ``P2``
-    must coincide exactly.
-
-    The distance is defined by
-    .. math::
-        d(P_1, P_2)
-        =
-        \left\|
-        \log\!\left(P_1^{-1/2} P_2 P_1^{-1/2}\right)
-        \right\|_F.
-
-    Equivalently, if :math:`\lambda_1, \dots, \lambda_p` are the eigenvalues of
-    :math:`P_1^{-1/2} P_2 P_1^{-1/2}`, then
-    .. math::
-        d(P_1, P_2)
-        =
-        \left(\sum_{i=1}^p (\log \lambda_i)^2\right)^{1/2}.
+    Compute affine-invariant distances between matched SPD matrices.
 
     Parameters
     ----------
-    P1, P2 : np.ndarray or torch.Tensor
-        Input SPD matrices or batches of SPD matrices.
+    P1_inv_half : np.ndarray or torch.Tensor
+        Inverse square root of the first SPD matrix.
 
-        - If ``GPU=False``, then ``P1`` and ``P2`` are assumed to be NumPy arrays.
-        - If ``GPU=True``, then ``P1`` and ``P2`` are assumed to be CUDA torch
-          tensors.
+        Shape:
+        - ``(p, p)``
+        - ``(*batch_shape, p, p)``
 
-        Supported shapes are:
+    P2_matrix : np.ndarray or torch.Tensor
+        Second SPD matrix.
 
-        - ``(p, p)`` for a single query;
-        - ``(M, p, p)`` for a batch of ``M`` matched queries.
+        Shape must match ``P1_inv_half``.
 
     atol : float, default=1e-12
-        Numerical tolerance used to guard against non-positive eigenvalues
-        caused by floating-point error.
-
-    GPU : bool, default=False
-        Indicator of the computational backend. If ``False``, the computation
-        is carried out with NumPy on CPU. If ``True``, the computation is
-        carried out with PyTorch on CUDA.
+        Lower bound applied to eigenvalues.
 
     Returns
     -------
     float or np.ndarray or torch.Tensor
-        The affine-invariant distance(s).
+        Affine-invariant SPD distance.
 
-        - If ``P1.shape == P2.shape == (p, p)``, returns a scalar ``float``.
-        - If ``P1.shape == P2.shape == (M, p, p)``, returns a one-dimensional
-          object of length ``M``:
-            * a NumPy array when ``GPU=False``;
-            * a torch tensor when ``GPU=True``.
-
-    Raises
-    ------
-    ValueError
-        If ``P1`` and ``P2`` do not have identical shapes, are not two- or
-        three-dimensional, or do not represent square matrices.
-
-    Notes
-    -----
-    This routine assumes that all input matrices are SPD. No explicit symmetry
-    or positive-definiteness checks are performed beyond the numerical clipping
-    safeguard on eigenvalues.
+        - Shape ``(p, p)`` returns ``float``.
+        - Shape ``(*batch_shape, p, p)`` returns ``(*batch_shape,)``.
     """
-    if P1.shape != P2.shape:
-        raise ValueError(
-            f"P1 and P2 must have identical shapes, but got "
-            f"{tuple(P1.shape)} and {tuple(P2.shape)}."
+    if type(P1_inv_half) is not type(P2_matrix):
+        raise TypeError(
+            "Bundle_P1.inv_half and Bundle_P2.matrix must have the same backend: "
+            "both np.ndarray or both torch.Tensor."
         )
 
-    if not GPU:
-        if P1.ndim == 2:
-            if P1.shape[0] != P1.shape[1]:
-                raise ValueError(
-                    f"Each SPD matrix must be square, but got shape {tuple(P1.shape)}."
-                )
+    if P1_inv_half.shape != P2_matrix.shape:
+        raise ValueError(
+            f"Shape mismatch: P1_inv_half has shape {tuple(P1_inv_half.shape)}, "
+            f"but P2_matrix has shape {tuple(P2_matrix.shape)}."
+        )
 
-            vals, vecs = np.linalg.eigh(P1)
-            vals = np.maximum(vals, atol)
-            P1_inv_half = vecs @ np.diag(1.0 / np.sqrt(vals)) @ vecs.T
+    # ============================================================
+    # Torch backend
+    # ============================================================
+    if isinstance(P1_inv_half, torch.Tensor):
 
-            M = P1_inv_half @ P2 @ P1_inv_half
-            M = 0.5 * (M + M.T)
-
-            lam = np.linalg.eigvalsh(M)
-            lam = np.maximum(lam, atol)
-
-            return float(np.sqrt(np.sum(np.log(lam) ** 2)))
-
-        if P1.ndim == 3:
-            if P1.shape[1] != P1.shape[2]:
-                raise ValueError(
-                    f"Each SPD matrix must be square, but got shape {tuple(P1.shape[1:])}."
-                )
-
-            vals, vecs = np.linalg.eigh(P1)                       # (M, p), (M, p, p)
-            vals = np.maximum(vals, atol)
-
-            inv_sqrt_diag = 1.0 / np.sqrt(vals)                  # (M, p)
-            P1_inv_half = np.matmul(
-                vecs * inv_sqrt_diag[:, None, :],
-                np.transpose(vecs, (0, 2, 1))
-            )                                                    # (M, p, p)
-
-            M = np.matmul(np.matmul(P1_inv_half, P2), P1_inv_half)
-            M = 0.5 * (M + np.transpose(M, (0, 2, 1)))
-
-            lam = np.linalg.eigvalsh(M)                          # (M, p)
-            lam = np.maximum(lam, atol)
-
-            return np.sqrt(np.sum(np.log(lam) ** 2, axis=1))
-
-        raise ValueError("Inputs must be either two- or three-dimensional.")
-
-    if P1.ndim == 2:
-        if P1.shape[0] != P1.shape[1]:
+        if P1_inv_half.device != P2_matrix.device:
             raise ValueError(
-                f"Each SPD matrix must be square, but got shape {tuple(P1.shape)}."
+                f"Device mismatch: "
+                f"P1_inv_half.device={P1_inv_half.device}, "
+                f"P2_matrix.device={P2_matrix.device}."
+            )
+        if P1_inv_half.dtype != P2_matrix.dtype:
+            raise ValueError(
+                f"Dtype mismatch: "
+                f"P1_inv_half.dtype={P1_inv_half.dtype}, "
+                f"P2_matrix.dtype={P2_matrix.dtype}."
             )
 
-        vals, vecs = torch.linalg.eigh(P1)
-        vals = torch.clamp(vals, min=atol)
-        P1_inv_half = vecs @ torch.diag(1.0 / torch.sqrt(vals)) @ vecs.transpose(-1, -2)
+        if P1_inv_half.ndim == 2:
+            P1_inv_half = P1_inv_half.unsqueeze(0)
+            P2_matrix = P2_matrix.unsqueeze(0)
 
-        M = P1_inv_half @ P2 @ P1_inv_half
-        M = 0.5 * (M + M.transpose(-1, -2))
+        p = P1_inv_half.shape[-1]
 
-        lam = torch.linalg.eigvalsh(M)
-        lam = torch.clamp(lam, min=atol)
+        G = P1_inv_half @ P2_matrix @ P1_inv_half
+        G = 0.5 * (G + G.transpose(-1, -2))
 
-        return float(torch.sqrt(torch.sum(torch.log(lam) ** 2)).item())
+        if p == 2:
+            a = G[..., 0, 0]
+            b = G[..., 0, 1]
+            c = G[..., 1, 1]
 
-    if P1.ndim == 3:
-        if P1.shape[1] != P1.shape[2]:
-            raise ValueError(
-                f"Each SPD matrix must be square, but got shape {tuple(P1.shape[1:])}."
+            tr_half = 0.5 * (a + c)
+            rad = torch.sqrt(
+                torch.clamp((0.5 * (a - c)) ** 2 + b ** 2, min=0.0)
             )
 
-        vals, vecs = torch.linalg.eigh(P1)                       # (M, p), (M, p, p)
-        vals = torch.clamp(vals, min=atol)
+            lam1 = torch.clamp(tr_half - rad, min=atol)
+            lam2 = torch.clamp(tr_half + rad, min=atol)
 
-        inv_sqrt_diag = 1.0 / torch.sqrt(vals)                  # (M, p)
-        P1_inv_half = torch.matmul(
-            vecs * inv_sqrt_diag[:, None, :],
-            vecs.transpose(-1, -2)
-        )                                                       # (M, p, p)
+            out = torch.sqrt(torch.log(lam1) ** 2 + torch.log(lam2) ** 2)
+        else:
+            lam = torch.linalg.eigvalsh(G)
+            lam = torch.clamp(lam, min=atol)
+            out = torch.sqrt(torch.sum(torch.log(lam) ** 2, dim=-1))
 
-        M = torch.matmul(torch.matmul(P1_inv_half, P2), P1_inv_half)
-        M = 0.5 * (M + M.transpose(-1, -2))
+        if P1_inv_half.ndim == 2:
+            return float(out.item())
+        
+        return out
 
-        lam = torch.linalg.eigvalsh(M)                          # (M, p)
-        lam = torch.clamp(lam, min=atol)
+    # ============================================================
+    # NumPy backend
+    # ============================================================
+    if isinstance(P1_inv_half, np.ndarray):
 
-        return torch.sqrt(torch.sum(torch.log(lam) ** 2, dim=1))
+        if P1_inv_half.ndim == 2:
+            P1_inv_half = P1_inv_half[None, ...]
+            P2_matrix = P2_matrix[None, ...]
 
-    raise ValueError("Inputs must be either two- or three-dimensional.")
+        p = P1_inv_half.shape[-1]
+
+        G = P1_inv_half @ P2_matrix @ P1_inv_half
+        G = 0.5 * (G + np.swapaxes(G, -1, -2))
+
+        if p == 2:
+            a = G[..., 0, 0]
+            b = G[..., 0, 1]
+            c = G[..., 1, 1]
+
+            tr_half = 0.5 * (a + c)
+            rad = np.sqrt(
+                np.clip((0.5 * (a - c)) ** 2 + b ** 2, a_min=0.0, a_max=None)
+            )
+
+            lam1 = np.clip(tr_half - rad, a_min=atol, a_max=None)
+            lam2 = np.clip(tr_half + rad, a_min=atol, a_max=None)
+
+            out = np.sqrt(np.log(lam1) ** 2 + np.log(lam2) ** 2)
+        else:
+            lam = np.linalg.eigvalsh(G)
+            lam = np.clip(lam, a_min=atol, a_max=None)
+            out = np.sqrt(np.sum(np.log(lam) ** 2, axis=-1))
+        
+        if P1_inv_half.ndim == 2:
+            return float(out.item())
+        
+        return out
 
 
 def compute_distance(
-    a: Union[np.ndarray, torch.Tensor],
-    b: Union[np.ndarray, torch.Tensor],
+    X: ArrayLike,
+    Y: ArrayLike,
     space_type: Literal["euclidean", "sphere", "spd"],
-    GPU: bool = False,
 ) -> Union[float, np.ndarray, torch.Tensor]:
     r"""
-    Compute the distance between matched inputs in a supported metric space.
-
-    This function provides a unified interface for the distance routines on the
-    Euclidean space, the unit sphere, and the space of symmetric positive
-    definite matrices equipped with the Cholesky distance.
+    Dispatch to the distance function for the given metric space.
 
     Parameters
     ----------
-    a, b : np.ndarray or torch.Tensor
-        Input objects whose distance is to be computed.
-
-        - If ``GPU=False``, then ``a`` and ``b`` are assumed to be NumPy arrays.
-        - If ``GPU=True``, then ``a`` and ``b`` are assumed to be CUDA torch
-          tensors.
-
-        The admissible shapes depend on ``space_type``:
-
-        - ``space_type="euclidean"``:
-          ``(d,)`` or ``(M, d)``;
-        - ``space_type="sphere"``:
-          ``(d,)`` or ``(M, d)``;
-        - ``space_type="spd"``:
-          ``(p, p)`` or ``(M, p, p)``.
-
-        In all cases, strict shape matching is imposed: no broadcasting is
-        performed, and ``a`` and ``b`` must have identical shapes.
+    X, Y : np.ndarray or torch.Tensor
+        Matched inputs with identical shape.
 
     space_type : {"euclidean", "sphere", "spd"}
-        The metric space in which the distance is computed.
-
-    GPU : bool, default=False
-        Indicator of the computational backend. If ``False``, the computation
-        is carried out with NumPy on CPU. If ``True``, the computation is
-        carried out with PyTorch on CUDA.
+        Metric space type.
 
     Returns
     -------
     float or np.ndarray or torch.Tensor
-        The computed distance(s).
-
-        - For a single matched pair, returns a scalar ``float``.
-        - For a matched batch, returns a one-dimensional object:
-            * a NumPy array when ``GPU=False``;
-            * a torch tensor when ``GPU=True``.
-
-    Raises
-    ------
-    ValueError
-        If ``space_type`` is not one of ``"euclidean"``, ``"sphere"``, or
-        ``"spd"``.
-
-    Notes
-    -----
-    This function is a dispatcher only. All shape validation and metric-specific
-    computations are delegated to the corresponding backend routine.
+        Distance values.
     """
+    if type(X) is not type(Y):
+        raise TypeError(
+            "X and Y must use the same backend."
+        )
+
     if space_type == "euclidean":
-        return euclidean_distance(a, b, GPU=GPU)
+        return euclidean_distance(X, Y)
 
     if space_type == "sphere":
-        return sphere_geodesic_distance(a, b, GPU=GPU)
+        return sphere_geodesic_distance(X, Y)
 
     if space_type == "spd":
-        return spd_affine_invariant_distance(a, b, GPU=GPU)
+        return spd_affine_invariant_distance(X, Y)
 
     raise ValueError(
-        "space_type must be one of {'euclidean', 'sphere', 'spd'}."
+        "space_type must be one of "
+        "{'euclidean', 'sphere', 'spd'}."
     )
 
 
 # ============================================================
-# Single-space ball indicator and empirical MDF
+# Auxiliary utilities
 # ------------------------------------------------------------
-# This section implements the ball indicator and the empirical
-# metric distribution function on a single metric space.
+# This section provides small helper functions used by the
+# statistic computation.
 #
-# The indicator is defined by
-#   delta(u, v, x) = 1{ d(u, x) <= d(u, v) + atol },
-# where d denotes the metric associated with the specified
-# space type.
+# Main utilities:
+#   - _main_left:
+#       return the left-side representation used in distance calls.
 #
-# The corresponding empirical metric distribution function is
-# obtained by averaging this indicator over the sample.
+#   - _main_right:
+#       return the right-side representation used in distance calls.
+#
+#   - broadcast_pair_array:
+#       create pairwise or pairwise-Monte-Carlo broadcasted views.
 #
 # Backend convention:
-#   * If GPU=False, computations are carried out with NumPy on CPU.
-#   * If GPU=True, computations are carried out with PyTorch on CUDA.
-#
-# Throughout, strict shape matching is imposed and no broadcasting
-# is performed except where a single query point is explicitly
-# expanded against a batch of observations.
+#   - NumPy arrays use np.broadcast_to.
+#   - Torch tensors use unsqueeze + expand.
 # ============================================================
 
 
-def delta_single(
-    u: Union[np.ndarray, torch.Tensor],
-    v: Union[np.ndarray, torch.Tensor],
-    x: Union[np.ndarray, torch.Tensor],
-    space_type: Literal["euclidean", "sphere", "spd"],
-    atol: float = 1e-12,
-    GPU: bool = False,
-) -> Union[int, np.ndarray, torch.Tensor]:
+def _main_left(bundle: DataBundle) -> ArrayLike:
     r"""
-    Compute the single-space ball indicator
-    ``delta(u, v, x) = 1{ d(u, x) <= d(u, v) + atol }``.
-
-    This function supports three input regimes:
-
-    (i) a single query, where ``u``, ``v``, and ``x`` have identical shapes;
-    (ii) a batched evaluation in ``x``, where ``u`` and ``v`` represent single
-    points and ``x`` is a batch of observations;
-    (iii) a matched batched evaluation, where ``u``, ``v``, and ``x`` are all
-    batches with identical shapes.
+    Return the left-side representation for distance computation.
 
     Parameters
     ----------
-    u, v, x : np.ndarray or torch.Tensor
-        Input objects in a common metric space.
-
-        - If ``space_type`` is ``"euclidean"`` or ``"sphere"``, the admissible
-          shapes are ``(d,)`` and ``(M, d)``.
-        - If ``space_type`` is ``"spd"``, the admissible shapes are
-          ``(p, p)`` and ``(M, p, p)``.
-
-        If ``GPU=False``, inputs are assumed to be NumPy arrays.
-        If ``GPU=True``, inputs are assumed to be CUDA torch tensors.
-
-    space_type : {"euclidean", "sphere", "spd"}
-        The metric space in which the indicator is evaluated.
-
-    atol : float, default=1e-12
-        Absolute tolerance in the comparison
-        ``d(u, x) <= d(u, v) + atol``.
-
-    GPU : bool, default=False
-        Indicator of the computational backend. If ``False``, the computation
-        is carried out with NumPy on CPU. If ``True``, the computation is
-        carried out with PyTorch on CUDA.
-
-    Returns
-    -------
-    int or np.ndarray or torch.Tensor
-        The indicator value(s).
-
-        - Returns an ``int`` for a single query.
-        - Returns a one-dimensional NumPy array when ``GPU=False`` and the
-          evaluation is batched.
-        - Returns a one-dimensional torch tensor when ``GPU=True`` and the
-          evaluation is batched.
-
-    Raises
-    ------
-    ValueError
-        If the input shapes are incompatible.
-
-    Notes
-    -----
-    This function assumes that the input types are already consistent with the
-    selected backend. No implicit conversion between NumPy arrays and torch
-    tensors is performed.
-    """
-    if x.ndim == u.ndim:
-        if u.shape != v.shape or u.shape != x.shape:
-            raise ValueError(
-                f"When x.ndim == u.ndim, expected u, v, and x to have identical "
-                f"shapes, but got u.shape={tuple(u.shape)}, "
-                f"v.shape={tuple(v.shape)}, and x.shape={tuple(x.shape)}."
-            )
-
-        dux = compute_distance(u, x, space_type, GPU=GPU)
-        duv = compute_distance(u, v, space_type, GPU=GPU)
-
-        if GPU:
-            if isinstance(dux, torch.Tensor):
-                return (dux <= duv + atol).to(torch.int32)
-            return int(dux <= duv + atol)
-
-        if isinstance(dux, np.ndarray):
-            return (dux <= duv + atol).astype(int)
-        return int(dux <= duv + atol)
-
-    if x.ndim == u.ndim + 1:
-        if u.shape != v.shape:
-            raise ValueError(
-                f"When x is batched and u, v are single points, expected "
-                f"u.shape == v.shape, but got {tuple(u.shape)} and {tuple(v.shape)}."
-            )
-
-        if GPU:
-            U = u.unsqueeze(0).expand(x.shape[0], *u.shape)
-            V = v.unsqueeze(0).expand(x.shape[0], *v.shape)
-            dux = compute_distance(U, x, space_type, GPU=True)
-            duv = compute_distance(U, V, space_type, GPU=True)
-            return (dux <= duv + atol).to(torch.int32)
-
-        U = np.broadcast_to(u, (x.shape[0],) + u.shape)
-        V = np.broadcast_to(v, (x.shape[0],) + v.shape)
-        dux = compute_distance(U, x, space_type, GPU=False)
-        duv = compute_distance(U, V, space_type, GPU=False)
-        return (dux <= duv + atol).astype(int)
-
-    raise ValueError(
-        f"Incompatible shapes for delta_single: "
-        f"u.shape={tuple(u.shape)}, v.shape={tuple(v.shape)}, "
-        f"x.shape={tuple(x.shape)}."
-    )
-
-
-def emdf_single(
-    samples: Union[np.ndarray, torch.Tensor],
-    u: Union[np.ndarray, torch.Tensor],
-    v: Union[np.ndarray, torch.Tensor],
-    space_type: Literal["euclidean", "sphere", "spd"],
-    atol: float = 1e-12,
-    GPU: bool = False,
-) -> float:
-    r"""
-    Empirical MDF with pre-stacked samples.
-    """
-    if samples.shape[0] == 0:
-        raise ValueError("samples must be non-empty.")
-
-    vals = delta_single(u, v, samples, space_type, atol=atol, GPU=GPU)
-
-    if GPU:
-        return float(vals.to(torch.float64).mean().item())
-
-    return float(np.mean(vals))
-
-
-# ============================================================
-# Product-space indicator
-# ------------------------------------------------------------
-# This section implements the product-space ball indicator together
-# with a helper routine for grouping components that share the same
-# metric-space type.
-#
-# For each sample index m and component index k, a componentwise
-# indicator is first computed in the corresponding metric space.
-# The product-space indicator is then obtained by taking the product
-# over all components k = 1, ..., K.
-#
-# To improve efficiency in repeated evaluations, components having
-# the same metric-space type are grouped in advance and processed
-# jointly in batch form.
-#
-# Backend convention:
-#   * If GPU=False, computations are carried out with NumPy on CPU.
-#   * If GPU=True, computations are carried out with PyTorch on CUDA.
-#
-# Throughout, inputs are assumed to represent matched batches in
-# product space, with common leading shape (M, K, ...).
-# ============================================================
-
-
-def build_component_groups(
-    space_types: Sequence[str],
-) -> Dict[str, List[int]]:
-    r"""
-    Construct index groups for components sharing the same metric-space type.
-
-    Given a sequence of component-wise space types, this function partitions
-    the component indices into groups such that all indices in the same group
-    correspond to the same metric-space type.
-
-    Parameters
-    ----------
-    space_types : sequence of str
-        A sequence of length ``K`` specifying the metric-space type for each
-        component in a product space.
-
-    Returns
-    -------
-    dict[str, list[int]]
-        A dictionary mapping each distinct space type to a list of indices.
-
-        Specifically, for each key ``s``, the value is a list of indices
-        ``k`` such that ``space_types[k] == s``.
-
-    Notes
-    -----
-    This function is intended to be called once and reused across repeated
-    evaluations (e.g., in permutation tests or Monte Carlo simulations).
-    By precomputing the grouping structure, one avoids repeated traversal
-    of ``space_types`` inside performance-critical routines.
-    """
-    grouped_indices = defaultdict(list)
-
-    for k, s in enumerate(space_types):
-        grouped_indices[s].append(k)
-
-    return dict(grouped_indices)
-
-
-def delta_product(
-    u: Union[np.ndarray, torch.Tensor],
-    v: Union[np.ndarray, torch.Tensor],
-    xyz: Union[np.ndarray, torch.Tensor],
-    component_groups: Dict[str, List[int]],
-    atol: float = 1e-12,
-    GPU: bool = False,
-) -> Union[np.ndarray, torch.Tensor]:
-    r"""
-    Compute the product-space ball indicator for a matched batch of inputs.
-
-    For each sample index ``m = 1, \ldots, M``, this function evaluates
-
-    .. math::
-        \delta_m
-        =
-        \prod_{k=1}^K
-        1\{ d_k(u_{m,k}, x_{m,k}) \le d_k(u_{m,k}, v_{m,k}) + \mathrm{atol} \},
-
-    where ``K`` is the number of product components and ``d_k`` denotes the
-    metric associated with the ``k``-th component.
-
-    Parameters
-    ----------
-    u, v, xyz : np.ndarray or torch.Tensor
-        Arrays/tensors of shape ``(M, K, ...)`` representing a matched batch
-        of ``M`` observations in a product space.
-
-        If ``GPU=False``, inputs are assumed to be NumPy arrays.
-        If ``GPU=True``, inputs are assumed to be CUDA torch tensors.
-
-    component_groups : dict[str, list[int]]
-        A dictionary mapping each metric-space type to the list of component
-        indices having that type.
-
-        For example,
-        ``{"euclidean": [0, 2], "sphere": [1], "spd": [3]}``
-        indicates that components 0 and 2 are Euclidean, component 1 is
-        spherical, and component 3 is SPD-valued.
-
-    atol : float, default=1e-12
-        Absolute tolerance in the comparison
-        ``d_k(u_{m,k}, x_{m,k}) <= d_k(u_{m,k}, v_{m,k}) + atol``.
-
-    GPU : bool, default=False
-        Indicator of the computational backend. If ``False``, the computation
-        is carried out with NumPy on CPU. If ``True``, the computation is
-        carried out with PyTorch on CUDA.
+    bundle : DataBundle
+        Input data bundle.
 
     Returns
     -------
     np.ndarray or torch.Tensor
-        A one-dimensional object of length ``M`` containing the product-space
-        indicator values.
+        Left-side representation used in distance evaluation.
 
-        - Returns a NumPy array when ``GPU=False``.
-        - Returns a torch tensor when ``GPU=True``.
+        - SPD bundle:
+            returns ``bundle.inv_half``
 
-    Raises
-    ------
-    ValueError
-        If the input shapes are incompatible, do not represent batched
-        product-space observations, or if the component indices are invalid.
-
-    Notes
-    -----
-    Components sharing the same metric-space type are processed jointly in
-    batch form. The grouping structure is assumed to be precomputed, so that
-    repeated evaluations can avoid repeated traversal of the component-wise
-    space-type specification.
+        - Euclidean / spherical bundle:
+            returns ``bundle.data``
     """
-    if u.shape != v.shape or u.shape != xyz.shape:
-        raise ValueError(
-            f"u, v, and xyz must have identical shapes, but got "
-            f"{tuple(u.shape)}, {tuple(v.shape)}, and {tuple(xyz.shape)}."
-        )
-
-    if u.ndim < 3:
-        raise ValueError(
-            f"Expected input shape (M, K, ...), but got {tuple(u.shape)}."
-        )
-
-    M, K = u.shape[:2]
-    tail_shape = tuple(u.shape[2:])
-
-    if GPU:
-        indicators = torch.empty((M, K), dtype=torch.int8, device=u.device)
-    else:
-        indicators = np.empty((M, K), dtype=np.int8)
-
-    covered = set()
-
-    for space_type, idx_list in component_groups.items():
-        if len(idx_list) == 0:
-            continue
-
-        covered.update(idx_list)
-
-        group_size = len(idx_list)
-
-        u_sub = u[:, idx_list, ...]
-        v_sub = v[:, idx_list, ...]
-        xyz_sub = xyz[:, idx_list, ...]
-
-        u_flat = u_sub.reshape(M * group_size, *tail_shape)
-        v_flat = v_sub.reshape(M * group_size, *tail_shape)
-        xyz_flat = xyz_sub.reshape(M * group_size, *tail_shape)
-
-        dux = compute_distance(u_flat, xyz_flat, space_type, GPU=GPU)
-        duv = compute_distance(u_flat, v_flat, space_type, GPU=GPU)
-
-        if GPU:
-            ind_sub = (dux <= duv + atol).to(torch.int8).reshape(M, group_size)
-            indicators[:, idx_list] = ind_sub
-        else:
-            ind_sub = (dux <= duv + atol).astype(np.int8).reshape(M, group_size)
-            indicators[:, idx_list] = ind_sub
-
-    if covered != set(range(K)):
-        missing = sorted(set(range(K)) - covered)
-        raise ValueError(
-            f"component_groups does not cover all component indices. "
-            f"Missing indices: {missing}."
-        )
-
-    if GPU:
-        return torch.prod(indicators, dim=1)
-
-    return indicators.prod(axis=1)
+    if bundle.space_type == "spd":
+        return bundle.inv_half
+    return bundle.data
 
 
-# ============================================================
-# Helper: stack component arrays into product-space samples
-# ------------------------------------------------------------
-# This helper constructs a single array/tensor S whose second axis
-# indexes the components of a product space.
-#
-# Given K component arrays with a common leading dimension n,
-# the function returns a stacked object of shape (n, K, ...),
-# where each slice S[:, k, ...] corresponds to the k-th component.
-#
-# Backend convention:
-#   * GPU=False -> NumPy (CPU)
-#   * GPU=True  -> PyTorch (CUDA)
-#
-# This routine assumes that all inputs are already aligned and
-# compatible for stacking.
-# ============================================================
-
-
-def stack_product_samples(
-    *arrays: Union[np.ndarray, torch.Tensor],
-    GPU: bool = False,
-) -> Union[np.ndarray, torch.Tensor]:
+def _main_right(bundle: DataBundle) -> ArrayLike:
     r"""
-    Stack multiple component arrays into a unified product-space array.
-
-    This function takes a collection of arrays/tensors representing different
-    components of a product space and stacks them along a new axis so that
-    the second dimension indexes the components.
+    Return the right-side representation for distance computation.
 
     Parameters
     ----------
-    *arrays : np.ndarray or torch.Tensor
-        A variable number of input arrays/tensors, each representing one
-        component of the product space.
-
-        All inputs are assumed to:
-        - have the same leading dimension ``n`` (sample size);
-        - have identical trailing shapes.
-
-        If ``GPU=False``, inputs are assumed to be NumPy arrays.
-        If ``GPU=True``, inputs are assumed to be CUDA torch tensors.
-
-    GPU : bool, default=False
-        Indicator of the computational backend.
-
-    Returns
-    -------
-    S : np.ndarray or torch.Tensor
-        A stacked object of shape ``(n, K, ...)``, where ``K`` is the number
-        of components.
-
-        - Returns a NumPy array when ``GPU=False``.
-        - Returns a torch tensor when ``GPU=True``.
-
-    Notes
-    -----
-    This routine performs no runtime validation of input shapes for efficiency.
-    In particular, it assumes that all inputs share the same leading dimension
-    and are compatible for stacking. Violations of these assumptions may result
-    in runtime errors raised by the underlying NumPy or PyTorch stack operation.
-    """
-    if GPU:
-        return torch.stack(arrays, dim=1)
-
-    return np.stack(arrays, axis=1)
-
-
-# ============================================================
-# Product-space empirical MDF
-# ------------------------------------------------------------
-# This section implements empirical metric distribution functions
-# on product spaces, for both single query pairs and batched query
-# pairs.
-#
-# Given product-space samples x_1, ..., x_n, the empirical MDF is
-# obtained by averaging the product-space indicator over the sample.
-# The underlying indicator is evaluated componentwise according to
-# the precomputed grouping structure in ``component_groups``.
-#
-# The routine ``emdf_product`` handles a single query pair or a
-# matched batch of query points, whereas
-# ``emdf_product_pair_batch`` evaluates empirical MDF values for a
-# batch of query pairs simultaneously.
-#
-# Backend convention:
-#   * If GPU=False, computations are carried out with NumPy on CPU.
-#   * If GPU=True, computations are carried out with PyTorch on CUDA.
-#
-# Throughout, product-space samples are assumed to have shape
-# (n, K, ...), and query points are required to be compatible with
-# this representation.
-# ============================================================
-
-
-def emdf_product_pair_batch(
-    xyz_samples: Union[np.ndarray, torch.Tensor],
-    u_batch: Union[np.ndarray, torch.Tensor],
-    v_batch: Union[np.ndarray, torch.Tensor],
-    component_groups: Dict[str, List[int]],
-    atol: float = 1e-12,
-    GPU: bool = False,
-) -> Union[np.ndarray, torch.Tensor]:
-    r"""
-    Compute empirical metric distribution function values for a batch of
-    product-space query pairs.
-
-    For each query pair index ``b = 1, \ldots, B``, this function evaluates
-
-    .. math::
-        \hat{F}_n(u_b, v_b)
-        =
-        \frac{1}{n}
-        \sum_{i=1}^n
-        \delta(u_b, v_b, x_i),
-
-    where ``x_1, \ldots, x_n`` are the observed product-space samples and
-    ``\delta`` denotes the product-space indicator.
-
-    Parameters
-    ----------
-    xyz_samples : np.ndarray or torch.Tensor
-        Product-space samples of shape ``(n, K, ...)``.
-
-        If ``GPU=False``, inputs are assumed to be NumPy arrays.
-        If ``GPU=True``, inputs are assumed to be CUDA torch tensors.
-
-    u_batch, v_batch : np.ndarray or torch.Tensor
-        Batches of query points of shape ``(B, K, ...)``.
-
-        The shapes of ``u_batch`` and ``v_batch`` must be identical, and each
-        query point must have the same product-space shape as one sample point
-        in ``xyz_samples``.
-
-    component_groups : dict[str, list[int]]
-        A dictionary mapping each metric-space type to the list of component
-        indices having that type.
-
-    atol : float, default=1e-12
-        Absolute tolerance in the comparison used by the product-space
-        indicator.
-
-    GPU : bool, default=False
-        Indicator of the computational backend. If ``False``, the computation
-        is carried out with NumPy on CPU. If ``True``, the computation is
-        carried out with PyTorch on CUDA.
+    bundle : DataBundle
+        Input data bundle.
 
     Returns
     -------
     np.ndarray or torch.Tensor
-        A one-dimensional object of length ``B`` containing the empirical MDF
-        values for the query pairs.
+        Right-side representation used in distance evaluation.
 
-        - Returns a NumPy array when ``GPU=False``.
-        - Returns a torch tensor when ``GPU=True``.
+        - SPD bundle:
+            returns ``bundle.matrix``
 
-    Raises
-    ------
-    ValueError
-        If the input shapes are incompatible.
-
-    Notes
-    -----
-    This routine assumes that all inputs are already consistent with the
-    selected backend. No implicit conversion between NumPy arrays and torch
-    tensors is performed.
-
-    The computation is vectorized over both the sample index and the query-pair
-    index by forming a matched batch of size ``B * n``.
+        - Euclidean / spherical bundle:
+            returns ``bundle.data``
     """
-    if xyz_samples.ndim < 3:
-        raise ValueError(
-            f"xyz_samples must have shape (n, K, ...), but got {tuple(xyz_samples.shape)}."
-        )
-
-    if u_batch.shape != v_batch.shape:
-        raise ValueError(
-            f"u_batch and v_batch must have identical shapes, but got "
-            f"{tuple(u_batch.shape)} and {tuple(v_batch.shape)}."
-        )
-
-    point_shape = tuple(xyz_samples.shape[1:])   # (K, ...)
-    if tuple(u_batch.shape[1:]) != point_shape:
-        raise ValueError(
-            f"Each query point must have shape {point_shape}, but got "
-            f"{tuple(u_batch.shape[1:])}."
-        )
-
-    n = xyz_samples.shape[0]
-    B = u_batch.shape[0]
-
-    if GPU:
-        # Shapes: (B, n, K, ...)
-        u_exp = u_batch[:, None, ...].expand(B, n, *point_shape)
-        v_exp = v_batch[:, None, ...].expand(B, n, *point_shape)
-        x_exp = xyz_samples[None, :, ...].expand(B, n, *point_shape)
-    else:
-        batch_shape = (B, n) + point_shape
-        u_exp = np.broadcast_to(u_batch[:, None, ...], batch_shape)
-        v_exp = np.broadcast_to(v_batch[:, None, ...], batch_shape)
-        x_exp = np.broadcast_to(xyz_samples[None, :, ...], batch_shape)
-
-    vals = delta_product(
-        u=u_exp.reshape(B * n, *point_shape),
-        v=v_exp.reshape(B * n, *point_shape),
-        xyz=x_exp.reshape(B * n, *point_shape),
-        component_groups=component_groups,
-        atol=atol,
-        GPU=GPU,
-    )
-
-    if GPU:
-        return vals.reshape(B, n).to(torch.float64).mean(dim=1)
-
-    return vals.reshape(B, n).mean(axis=1)
+    if bundle.space_type == "spd":
+        return bundle.matrix
+    return bundle.data
 
 
-def emdf_product(
-    xyz_samples: Union[np.ndarray, torch.Tensor],
-    u: Union[np.ndarray, torch.Tensor],
-    v: Union[np.ndarray, torch.Tensor],
-    component_groups: Dict[str, List[int]],
-    atol: float = 1e-12,
-    GPU: bool = False,
-) -> float:
+def broadcast_pair_array(
+    X: ArrayLike | None,
+    mode: str,
+    rep: int | None = None,
+) -> ArrayLike | None:
     r"""
-    Compute a single empirical metric distribution function value on a product
-    space.
-
-    This is a thin wrapper around ``emdf_product_pair_batch`` for the case of
-    a single query pair.
+    Broadcast an array/tensor for pairwise statistic computation.
 
     Parameters
     ----------
-    xyz_samples : np.ndarray or torch.Tensor
-        Product-space samples of shape ``(n, K, ...)``.
+    X : np.ndarray, torch.Tensor, or None
+        Input array/tensor.
 
-    u, v : np.ndarray or torch.Tensor
-        Query points of shape ``(K, ...)``.
+        Expected shapes:
+        - ``(n, *tail_shape)`` for ``mode="ij"``, ``"ji"``, ``"ijm"``
+        - ``(n, M, *tail_shape)`` for ``mode="jim"``
 
-    component_groups : dict[str, list[int]]
-        Precomputed grouping of component indices by metric-space type.
+    mode : {"ij", "ji", "ijm", "jim"}
+        Broadcasting mode.
 
-    atol : float, default=1e-12
-        Absolute tolerance in the product-space indicator.
+        - ``"ij"``:
+            ``(n, *tail) -> (n, rep, *tail)``
 
-    GPU : bool, default=False
-        Indicator of the computational backend.
+        - ``"ji"``:
+            ``(n, *tail) -> (rep, n, *tail)``
+
+        - ``"ijm"``:
+            ``(n, *tail) -> (n, n, rep, *tail)``
+
+        - ``"jim"``:
+            ``(n, M, *tail) -> (n, n, M, *tail)``
+
+    rep : int or None, default=None
+        Repetition size. Required for ``mode="ijm"``.
+        For ``mode="ij"`` and ``"ji"``, defaults to ``n``.
 
     Returns
     -------
-    float
-        The empirical MDF value.
+    np.ndarray, torch.Tensor, or None
+        Broadcasted view with the requested pairwise shape.
     """
-    if GPU:
-        u_batch = u.unsqueeze(0)
-        v_batch = v.unsqueeze(0)
+    if X is None:
+        return None
+
+    if not isinstance(X, (np.ndarray, torch.Tensor)):
+        raise TypeError("X must be np.ndarray, torch.Tensor, or None.")
+        
+    if X.ndim < 2:
+        raise ValueError("X must have shape (n, *tail_shape).")
+
+    n = X.shape[0]
+
+    if mode in {"ij", "ji"}:
+        rep_eff = n if rep is None else rep
+        if rep_eff <= 0:
+            raise ValueError("rep must be positive.")
+
+        if isinstance(X, torch.Tensor):
+            if mode == "ij":
+                return X[:, None, ...].expand(n, rep_eff, *X.shape[1:])
+            return X[None, :, ...].expand(rep_eff, n, *X.shape[1:])
+        
+        if mode == "ij":
+            return np.broadcast_to(
+                X[:, None, ...],
+                (n, rep_eff, *X.shape[1:]),
+            )
+
+        return np.broadcast_to(
+            X[None, :, ...],
+            (rep_eff, n, *X.shape[1:]),
+        )
+
+    elif mode == "ijm":
+        if rep is None:
+            raise ValueError("For mode='ijm', rep must be provided and represents M.")
+        if rep <= 0:
+            raise ValueError("rep must be positive.")
+
+        if isinstance(X, torch.Tensor):
+            return X[:, None, None, ...].expand(n, n, rep, *X.shape[1:])
+
+        return np.broadcast_to(
+            X[:, None, None, ...],
+            (n, n, rep, *X.shape[1:]),
+        )
+
+    elif mode == "jim":
+        if X.ndim < 3:
+            raise ValueError("mode='jim' requires shape (n, M, *tail_shape).")
+
+        M = X.shape[1]
+
+        if isinstance(X, torch.Tensor):
+            return X[None, ...].expand(n, n, M, *X.shape[2:])
+
+        return np.broadcast_to(
+            X[None, ...],
+            (n, n, M, *X.shape[2:]),
+        )
     else:
-        u_batch = u[None, ...]
-        v_batch = v[None, ...]
-
-    out = emdf_product_pair_batch(
-        xyz_samples=xyz_samples,
-        u_batch=u_batch,
-        v_batch=v_batch,
-        component_groups=component_groups,
-        atol=atol,
-        GPU=GPU,
-    )
-
-    if GPU:
-        return float(out[0].item())
-
-    return float(out[0])
+        raise ValueError("mode must be one of {'ij', 'ji', 'ijm', 'jim'}.")
