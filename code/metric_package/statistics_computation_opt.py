@@ -1,55 +1,52 @@
-from scipy.linalg import expm
-from scipy.stats import wishart
 from metric_package.geometry_opt import (
-    build_component_groups,
-    stack_product_samples,
-    emdf_product_pair_batch,
+    DataBundle,
+    broadcast_pair_array,
+    _main_right, _main_left,
     compute_distance,
 )
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union, Literal
+from typing import Callable, Dict, Optional, Union, Literal
 import numpy as np
 import torch
 import time
 
 
-ArrayLike = Union[np.ndarray, List[np.ndarray]]
+ArrayLike = Union[np.ndarray, torch.Tensor]
 
 
 # ============================================================
-# Data generation
+# Data generation utilities
 # ------------------------------------------------------------
-# This section implements vectorized data-generating mechanisms
-# for the simulation settings considered in the paper.
+# This section provides vectorized data-generating mechanisms for
+# conditional independence simulations on metric spaces.
 #
-# The routines are kept in NumPy, since sample generation is not
-# the primary computational bottleneck relative to the repeated
-# evaluation of the test statistic and the resampling procedure.
+# Supported sample spaces:
+#   - Euclidean space;
+#   - the unit sphere;
+#   - the SPD manifold.
+#
+# The implementation supports both NumPy and PyTorch backends:
+#   - device="numpy" returns NumPy arrays;
+#   - device="cpu" or device="cuda" returns torch tensors.
+#
+# Shape convention:
+#   - Euclidean / sphere: (n, d)
+#   - SPD:                (n, p, p)
 # ============================================================
 
 
 def generate_data(
     n: int,
-    space_type: str = "euclidean",
+    space_type: Literal["euclidean", "sphere", "spd"] = "euclidean",
     size: int = 2,
     rho: float = 0.0,
     seed: int | None = None,
     sigma_perm: float = 2.0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    device: Literal["numpy", "cpu", "cuda"] | str | torch.device = "numpy",
+    dtype: np.dtype | torch.dtype | None = None,
+) -> tuple[ArrayLike, ArrayLike, ArrayLike]:
     r"""
-    Generate simulated samples ``(X, Y, Z)`` for conditional independence
-    experiments on metric spaces.
-
-    The data-generating mechanism depends on ``space_type`` and is constructed
-    so that the dependence between ``X`` and ``Y`` conditional on ``Z`` is
-    controlled by the parameter ``rho``. Specifically:
-
-    - For ``space_type="euclidean"``, the variables are generated in
-      Euclidean space with additive Gaussian perturbations.
-    - For ``space_type="sphere"``, the variables are generated on the unit
-      sphere by perturbing a base point ``Z`` along random tangent directions
-      and projecting back to the sphere.
-    - For ``space_type="spd"``, the variables are generated in the space of
-      symmetric positive definite matrices through Wishart-type constructions.
+    Generate simulated samples ``(X, Y, Z)`` for metric-space
+    conditional independence experiments.
 
     Parameters
     ----------
@@ -57,89 +54,205 @@ def generate_data(
         Sample size.
 
     space_type : {"euclidean", "sphere", "spd"}, default="euclidean"
-        Type of metric space on which the data are generated.
+        Metric space type.
 
     size : int, default=2
-        Dimension parameter of the ambient space.
+        Dimension parameter.
 
-        - If ``space_type`` is ``"euclidean"`` or ``"sphere"``, then
-          ``size`` is the ambient dimension ``d``.
-        - If ``space_type`` is ``"spd"``, then ``size`` is the matrix size
-          ``p``, so that the observations lie in the space of ``p x p``
-          symmetric positive definite matrices.
+        - Euclidean / sphere:
+            ambient dimension ``d``.
+        - SPD:
+            matrix dimension ``p``.
 
     rho : float, default=0.0
-        Dependence parameter controlling the conditional association between
-        ``X`` and ``Y`` given ``Z``. The value should satisfy ``-1 <= rho <= 1``.
+        Dependence parameter satisfying ``-1 <= rho <= 1``.
 
     seed : int or None, default=None
-        Seed for the random number generator.
+        Random seed.
 
     sigma_perm : float, default=2.0
-        Scale parameter for the perturbation magnitude in the Euclidean and
-        spherical cases.
+        Noise scale for Euclidean and spherical settings.
+
+    device : {"numpy", "cpu", "cuda"} or torch.device, default="numpy"
+        Backend/device used for generation.
+
+    dtype : numpy dtype, torch.dtype, or None, default=None
+        Floating-point dtype.
 
     Returns
     -------
-    X, Y, Z : tuple of np.ndarray
-        Generated samples.
+    X, Y, Z : tuple[ArrayLike, ArrayLike, ArrayLike]
 
-        - If ``space_type`` is ``"euclidean"`` or ``"sphere"``, each returned
-          array has shape ``(n, d)``.
-        - If ``space_type`` is ``"spd"``, each returned array has shape
-          ``(n, p, p)``.
+        Output shapes:
+
+        - Euclidean / sphere:
+            ``(n, d)``
+        - SPD:
+            ``(n, p, p)``
+
+        Backend follows ``device``:
+
+        - ``device="numpy"``:
+            returns ``np.ndarray``.
+        - otherwise:
+            returns ``torch.Tensor``.
 
     Raises
     ------
     ValueError
-        If ``space_type`` is invalid, or if ``size < 2`` in the spherical case.
+        If inputs are invalid.
 
-    Notes
-    -----
-    The implementation is vectorized over the sample index for computational
-    efficiency. In the SPD case, Wishart-distributed matrices are generated
-    through Gaussian matrix factors rather than repeated calls to a scalar
-    Wishart sampler.
+    RuntimeError
+        If CUDA is requested but unavailable.
     """
-    rng = np.random.default_rng(seed)
-    rho_comp = np.sqrt(max(0.0, 1.0 - rho**2))
+    if not (-1.0 <= rho <= 1.0):
+        raise ValueError("rho must satisfy -1 <= rho <= 1.")
 
-    # ------------------------------------------------------------
-    # Case 1: Euclidean space
-    # ------------------------------------------------------------
-    # The latent variable Z is generated from a standard Gaussian law.
-    # Conditional on Z, the variables X and Y are formed by adding Gaussian
-    # perturbations whose correlation is governed by rho.
-    # ------------------------------------------------------------
+    rho_comp = max(0.0, 1.0 - rho**2) ** 0.5
+
+    # ============================================================
+    # NumPy backend
+    # ============================================================
+    if device == "numpy":
+        if dtype is None:
+            dtype = np.float64
+
+        rng = np.random.default_rng(seed)
+
+        if space_type == "euclidean":
+            d = size
+            sigma = sigma_perm
+
+            Z = rng.normal(size=(n, d)).astype(dtype)
+            U = rng.normal(size=(n, d)).astype(dtype)
+            V = rng.normal(size=(n, d)).astype(dtype)
+
+            X = Z + sigma * U
+            Y = Z + sigma * (rho * U + rho_comp * V)
+
+            return X.astype(dtype), Y.astype(dtype), Z.astype(dtype)
+
+        elif space_type == "sphere":
+            d = size
+            sigma = sigma_perm
+
+            if d < 2:
+                raise ValueError("For spherical data, size must be at least 2.")
+
+            Z = rng.normal(size=(n, d)).astype(dtype)
+            Z /= np.linalg.norm(Z, axis=1, keepdims=True)
+
+            U = rng.normal(size=(n, d)).astype(dtype)
+            U = U - np.sum(U * Z, axis=1, keepdims=True) * Z
+            U_norm = np.linalg.norm(U, axis=1, keepdims=True)
+
+            V = rng.normal(size=(n, d)).astype(dtype)
+            V = V - np.sum(V * Z, axis=1, keepdims=True) * Z
+            V_norm = np.linalg.norm(V, axis=1, keepdims=True)
+
+            bad_u = U_norm[:, 0] < 1e-14
+            while np.any(bad_u):
+                bad_idx = np.where(bad_u)[0]
+
+                U_new = rng.normal(size=(bad_idx.size, d)).astype(dtype)
+                Z_bad = Z[bad_idx]
+
+                U_new = U_new - np.sum(U_new * Z_bad, axis=1, keepdims=True) * Z_bad
+                U_new_norm = np.linalg.norm(U_new, axis=1, keepdims=True)
+
+                good_new = U_new_norm[:, 0] >= 1e-14
+                good_idx = bad_idx[good_new]
+
+                U[good_idx] = U_new[good_new]
+                U_norm[good_idx] = U_new_norm[good_new]
+
+                bad_u[good_idx] = False
+
+            bad_v = V_norm[:, 0] < 1e-14
+            while np.any(bad_v):
+                bad_idx = np.where(bad_v)[0]
+
+                V_new = rng.normal(size=(bad_idx.size, d)).astype(dtype)
+                Z_bad = Z[bad_idx]
+
+                V_new = V_new - np.sum(V_new * Z_bad, axis=1, keepdims=True) * Z_bad
+                V_new_norm = np.linalg.norm(V_new, axis=1, keepdims=True)
+
+                good_new = V_new_norm[:, 0] >= 1e-14
+                good_idx = bad_idx[good_new]
+
+                V[good_idx] = V_new[good_new]
+                V_norm[good_idx] = V_new_norm[good_new]
+
+                bad_v[good_idx] = False
+
+            U /= U_norm
+            V /= V_norm
+
+            eps1 = rng.normal(size=(n, 1)).astype(dtype)
+            eps2 = rng.normal(size=(n, 1)).astype(dtype)
+
+            X = Z + sigma * eps1 * U
+            Y = Z + sigma * (rho * eps1 + rho_comp * eps2) * V
+
+            X /= np.linalg.norm(X, axis=1, keepdims=True)
+            Y /= np.linalg.norm(Y, axis=1, keepdims=True)
+
+            return X.astype(dtype), Y.astype(dtype), Z.astype(dtype)
+
+        elif space_type == "spd":
+            p = size
+            nu = p + 6
+
+            A = rng.normal(size=(n, nu, p)).astype(dtype)
+            Z = np.matmul(np.transpose(A, (0, 2, 1)), A) / nu
+
+            U = rng.normal(size=(n, nu, p)).astype(dtype)
+            V = rng.normal(size=(n, nu, p)).astype(dtype)
+            W = rho * U + rho_comp * V
+
+            Sx = np.matmul(np.transpose(U, (0, 2, 1)), U) / nu
+            Sy = np.matmul(np.transpose(W, (0, 2, 1)), W) / nu
+
+            Z_half = np.linalg.cholesky(Z)
+
+            X = Z_half @ Sx @ np.transpose(Z_half, (0, 2, 1))
+            Y = Z_half @ Sy @ np.transpose(Z_half, (0, 2, 1))
+
+            return X.astype(dtype), Y.astype(dtype), Z.astype(dtype)
+
+        else:
+            raise ValueError("space_type must be one of {'euclidean', 'sphere', 'spd'}.")
+
+    # ============================================================
+    # Torch backend: CPU / CUDA
+    # ============================================================
+    device = torch.device(device)
+
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available.")
+
+    if dtype is None:
+        dtype = torch.float64
+
+    if seed is not None:
+        torch.manual_seed(seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(seed)
+
     if space_type == "euclidean":
         d = size
         sigma = sigma_perm
 
-        Z = rng.normal(size=(n, d))
-        U = rng.normal(size=(n, d))
-        V = rng.normal(size=(n, d))
+        Z = torch.randn(n, d, device=device, dtype=dtype)
+        U = torch.randn(n, d, device=device, dtype=dtype)
+        V = torch.randn(n, d, device=device, dtype=dtype)
 
-        eps_x = sigma * U
-        eps_y = sigma * (rho * U + rho_comp * V)
+        X = Z + sigma * U
+        Y = Z + sigma * (rho * U + rho_comp * V)
 
-        X = Z + eps_x
-        Y = Z + eps_y
+        return X, Y, Z
 
-        return (
-            np.asarray(X, dtype=float),
-            np.asarray(Y, dtype=float),
-            np.asarray(Z, dtype=float),
-        )
-
-    # ------------------------------------------------------------
-    # Case 2: Unit sphere
-    # ------------------------------------------------------------
-    # A base point Z is first generated uniformly on the unit sphere by
-    # normalizing a Gaussian vector. Tangent directions are then sampled by
-    # projecting Gaussian vectors onto the tangent space at Z and normalizing.
-    # Finally, X and Y are obtained by tangent perturbations followed by
-    # renormalization onto the sphere.
-    # ------------------------------------------------------------
     elif space_type == "sphere":
         d = size
         sigma = sigma_perm
@@ -147,724 +260,452 @@ def generate_data(
         if d < 2:
             raise ValueError("For spherical data, size must be at least 2.")
 
-        # Generate base points on the unit sphere.
-        Z = rng.normal(size=(n, d))
-        Z /= np.linalg.norm(Z, axis=1, keepdims=True)
+        Z = torch.randn(n, d, device=device, dtype=dtype)
+        Z = Z / torch.linalg.norm(Z, dim=1, keepdim=True)
 
-        # Generate tangent directions for X.
-        U = rng.normal(size=(n, d))
-        U = U - np.sum(U * Z, axis=1, keepdims=True) * Z
-        U_norm = np.linalg.norm(U, axis=1, keepdims=True)
+        U = torch.randn(n, d, device=device, dtype=dtype)
+        U = U - torch.sum(U * Z, dim=1, keepdim=True) * Z
+        U_norm = torch.linalg.norm(U, dim=1, keepdim=True)
 
-        # Generate tangent directions for Y.
-        V = rng.normal(size=(n, d))
-        V = V - np.sum(V * Z, axis=1, keepdims=True) * Z
-        V_norm = np.linalg.norm(V, axis=1, keepdims=True)
+        V = torch.randn(n, d, device=device, dtype=dtype)
+        V = V - torch.sum(V * Z, dim=1, keepdim=True) * Z
+        V_norm = torch.linalg.norm(V, dim=1, keepdim=True)
 
-        # In rare degenerate cases, the projected vector may be numerically
-        # close to zero. Such entries are resampled until a valid tangent
-        # direction is obtained.
         bad_u = U_norm[:, 0] < 1e-14
+        while torch.any(bad_u):
+            bad_idx = torch.where(bad_u)[0]
+
+            U_new = torch.randn(bad_idx.numel(), d, device=device, dtype=dtype)
+            Z_bad = Z[bad_idx]
+
+            U_new = U_new - torch.sum(U_new * Z_bad, dim=1, keepdim=True) * Z_bad
+            U_new_norm = torch.linalg.norm(U_new, dim=1, keepdim=True)
+
+            good_new = U_new_norm[:, 0] >= 1e-14
+            good_idx = bad_idx[good_new]
+
+            U[good_idx] = U_new[good_new]
+            U_norm[good_idx] = U_new_norm[good_new]
+
+            bad_u[good_idx] = False
+
         bad_v = V_norm[:, 0] < 1e-14
+        while torch.any(bad_v):
+            bad_idx = torch.where(bad_v)[0]
 
-        while np.any(bad_u):
-            U_new = rng.normal(size=(bad_u.sum(), d))
-            Z_bad = Z[bad_u]
-            U_new = U_new - np.sum(U_new * Z_bad, axis=1, keepdims=True) * Z_bad
-            U[bad_u] = U_new
-            U_norm = np.linalg.norm(U, axis=1, keepdims=True)
-            bad_u = U_norm[:, 0] < 1e-14
+            V_new = torch.randn(bad_idx.numel(), d, device=device, dtype=dtype)
+            Z_bad = Z[bad_idx]
 
-        while np.any(bad_v):
-            V_new = rng.normal(size=(bad_v.sum(), d))
-            Z_bad = Z[bad_v]
-            V_new = V_new - np.sum(V_new * Z_bad, axis=1, keepdims=True) * Z_bad
-            V[bad_v] = V_new
-            V_norm = np.linalg.norm(V, axis=1, keepdims=True)
-            bad_v = V_norm[:, 0] < 1e-14
+            V_new = V_new - torch.sum(V_new * Z_bad, dim=1, keepdim=True) * Z_bad
+            V_new_norm = torch.linalg.norm(V_new, dim=1, keepdim=True)
 
-        U /= U_norm
-        V /= V_norm
+            good_new = V_new_norm[:, 0] >= 1e-14
+            good_idx = bad_idx[good_new]
 
-        # Generate correlated scalar perturbation magnitudes.
-        eps1 = rng.normal(size=(n, 1))
-        eps2 = rng.normal(size=(n, 1))
+            V[good_idx] = V_new[good_new]
+            V_norm[good_idx] = V_new_norm[good_new]
 
-        xi_x = sigma * eps1
-        xi_y = sigma * (rho * eps1 + rho_comp * eps2)
+            bad_v[good_idx] = False
 
-        # Perturb along tangent directions and project back to the sphere.
-        X = Z + xi_x * U
-        Y = Z + xi_y * V
+        U = U / U_norm
+        V = V / V_norm
 
-        X /= np.linalg.norm(X, axis=1, keepdims=True)
-        Y /= np.linalg.norm(Y, axis=1, keepdims=True)
+        eps1 = torch.randn(n, 1, device=device, dtype=dtype)
+        eps2 = torch.randn(n, 1, device=device, dtype=dtype)
 
-        return (
-            np.asarray(X, dtype=float),
-            np.asarray(Y, dtype=float),
-            np.asarray(Z, dtype=float),
-        )
+        X = Z + sigma * eps1 * U
+        Y = Z + sigma * (rho * eps1 + rho_comp * eps2) * V
 
-    # ------------------------------------------------------------
-    # Case 3: SPD space
-    # ------------------------------------------------------------
-    # The base matrix Z is generated from a scaled Wishart law through a
-    # Gaussian factor representation. Conditional perturbations are then
-    # constructed via correlated Gaussian matrix factors, yielding SPD-valued
-    # variables X and Y.
-    # ------------------------------------------------------------
+        X = X / torch.linalg.norm(X, dim=1, keepdim=True)
+        Y = Y / torch.linalg.norm(Y, dim=1, keepdim=True)
+
+        return X, Y, Z
+
     elif space_type == "spd":
         p = size
         nu = p + 6
 
-        # Generate Z ~ Wishart(nu, I_p) / nu via Gaussian factors.
-        A = rng.normal(size=(n, nu, p))
-        Z = np.matmul(np.transpose(A, (0, 2, 1)), A) / nu
+        A = torch.randn(n, nu, p, device=device, dtype=dtype)
+        Z = torch.matmul(A.transpose(-1, -2), A) / nu
 
-        # Generate correlated Gaussian matrix factors.
-        U = rng.normal(size=(n, nu, p))
-        V = rng.normal(size=(n, nu, p))
+        U = torch.randn(n, nu, p, device=device, dtype=dtype)
+        V = torch.randn(n, nu, p, device=device, dtype=dtype)
         W = rho * U + rho_comp * V
 
-        Sx = np.matmul(np.transpose(U, (0, 2, 1)), U) / nu
-        Sy = np.matmul(np.transpose(W, (0, 2, 1)), W) / nu
+        Sx = torch.matmul(U.transpose(-1, -2), U) / nu
+        Sy = torch.matmul(W.transpose(-1, -2), W) / nu
 
-        # Form X and Y by congruence transformation using the Cholesky factor
-        # of Z, which preserves positive definiteness.
-        Z_half = np.linalg.cholesky(Z)
+        Z_half = torch.linalg.cholesky(Z)
 
-        X = np.matmul(np.matmul(Z_half, Sx), np.transpose(Z_half, (0, 2, 1)))
-        Y = np.matmul(np.matmul(Z_half, Sy), np.transpose(Z_half, (0, 2, 1)))
+        X = Z_half @ Sx @ Z_half.transpose(-1, -2)
+        Y = Z_half @ Sy @ Z_half.transpose(-1, -2)
 
-        return (
-            np.asarray(X, dtype=float),
-            np.asarray(Y, dtype=float),
-            np.asarray(Z, dtype=float),
-        )
+        return X, Y, Z
 
     else:
         raise ValueError("space_type must be one of {'euclidean', 'sphere', 'spd'}.")
 
 
 # ============================================================
-# Conditional generators
-# ------------------------------------------------------------
-# This module provides conditional sample generators for
-# metric-space models. The interface is designed to support both
-# oracle generators and learned black-box models (e.g., neural
-# conditional samplers).
-#
-# Each generator may implement either:
-#   (i) a single-sample interface via ``__call__``, or
-#   (ii) a batched interface via ``generate_batch``.
-#
-# This abstraction allows the downstream simulation and testing
-# routines to remain agnostic to the underlying generation
-# mechanism.
-# ============================================================
-
-
-def generate_conditional_samples(
-    Z: np.ndarray,
-    M: int,
-    generators,
-    space_type: str = "euclidean",
-    seed: int | None = None,
-    **kwargs,
-) -> tuple[np.ndarray, np.ndarray]:
-    r"""
-    Generate conditional samples for a batch of conditioning values.
-
-    For each observed conditioning value ``Z_i``, this function generates
-    ``M`` conditional sample pairs from the user-supplied generator
-    ``generators``. The generator may either be a single-sample sampler
-    accepting one conditioning value at a time, or a batched sampler
-    implementing a ``generate_batch`` method.
-
-    Parameters
-    ----------
-    Z : np.ndarray
-        Batch of conditioning values.
-
-        If the conditioning variable takes values in a Euclidean or spherical
-        space, then ``Z`` typically has shape ``(n, d)``. If it takes values
-        in an SPD space, then ``Z`` typically has shape ``(n, p, p)``.
-
-    M : int
-        Number of conditional replications generated for each observation.
-
-    generators : callable or object
-        Conditional generator. Two interfaces are supported:
-
-        1. A callable with signature
-           ``generators(z, space_type=..., rng=..., **kwargs)``,
-           returning one sample pair ``(x, y)`` for a single conditioning
-           value ``z``;
-
-        2. An object implementing a method
-           ``generate_batch(Z, M=..., space_type=..., rng=..., **kwargs)``,
-           returning batched conditional samples directly.
-
-        This design allows the generator to represent either an oracle sampler
-        or a fitted black-box model, such as a neural conditional generator.
-
-    space_type : {"euclidean", "sphere", "spd"}, default="euclidean"
-        Metric-space type.
-
-    seed : int or None, default=None
-        Seed for the random number generator used in conditional sampling.
-
-    **kwargs
-        Additional keyword arguments passed to the generator.
-
-    Returns
-    -------
-    X_all, Y_all : tuple of np.ndarray
-        Arrays containing the generated conditional samples.
-
-        If each generated sample has shape ``s``, then each returned array has
-        shape ``(n, M) + s``.
-
-    Notes
-    -----
-    This routine does not assume that the conditional generator admits a
-    closed-form or vectorized representation. When a batched implementation is
-    available through ``generate_batch``, it is used directly; otherwise the
-    samples are generated by repeated calls to the single-sample generator.
-    """
-    rng = np.random.default_rng(seed)
-
-    if hasattr(generators, "generate_batch") and callable(generators.generate_batch):
-        return generators.generate_batch(
-            Z,
-            M=M,
-            space_type=space_type,
-            rng=rng,
-            **kwargs,
-        )
-
-    X_all = []
-    Y_all = []
-
-    for z in Z:
-        Xi = []
-        Yi = []
-
-        for _ in range(M):
-            x, y = generators(z, space_type=space_type, rng=rng, **kwargs)
-            Xi.append(x)
-            Yi.append(y)
-
-        X_all.append(np.stack(Xi, axis=0))
-        Y_all.append(np.stack(Yi, axis=0))
-
-    return np.stack(X_all, axis=0), np.stack(Y_all, axis=0)
-
-
-# ============================================================
-# Oracle product-form estimator
-# ------------------------------------------------------------
-# This section implements batched evaluations of the oracle
-# product-form estimator ``\hat F_n^{M,\perp}``, which is one of
-# the main computational components of the statistic.
-#
-# The implementation is designed so that the dominant batched
-# distance and indicator calculations can be carried out on GPU
-# when PyTorch/CUDA is used.
-# ============================================================
-
-
-def f_perp_gen_pair_batch(
-    u_batch: Union[np.ndarray, torch.Tensor],
-    v_batch: Union[np.ndarray, torch.Tensor],
-    X_orc_array: Union[np.ndarray, torch.Tensor],
-    Y_orc_array: Union[np.ndarray, torch.Tensor],
-    Z_array: Union[np.ndarray, torch.Tensor],
-    space_types: Tuple[
-        Literal["euclidean", "sphere", "spd"],
-        Literal["euclidean", "sphere", "spd"],
-        Literal["euclidean", "sphere", "spd"],
-    ] = ("euclidean", "euclidean", "euclidean"),
-    atol: float = 1e-12,
-    GPU: bool = False,
-) -> Union[np.ndarray, torch.Tensor]:
-    r"""
-    Compute batched values of the oracle product-form estimator
-    ``\hat F_n^{M,\perp}(u, v)``.
-
-    For each query pair ``(u_b, v_b)``, this function evaluates
-    \[
-    \hat F_n^{M,\perp}(u_b, v_b)
-    =
-    \frac{1}{n}
-    \sum_{l=1}^n
-    \left[
-    \frac{1}{M}\sum_{m=1}^M
-    \delta_X(u_{b,x}, v_{b,x}, \tilde X_l^{(m)})
-    \right]
-    \left[
-    \frac{1}{M}\sum_{m=1}^M
-    \delta_Y(u_{b,y}, v_{b,y}, \tilde Y_l^{(m)})
-    \right]
-    \delta_Z(u_{b,z}, v_{b,z}, Z_l),
-    \]
-    where ``\tilde X_l^{(m)}`` and ``\tilde Y_l^{(m)}`` are oracle conditional
-    samples generated at ``Z_l``.
-
-    Parameters
-    ----------
-    u_batch, v_batch : np.ndarray or torch.Tensor
-        Batched query points of shape ``(B, 3, ...)``. The inputs are assumed
-        to be already consistent with the selected backend.
-
-    X_orc_array, Y_orc_array : np.ndarray or torch.Tensor
-        Oracle conditional samples of shape ``(n, M, ...)``.
-
-    Z_array : np.ndarray or torch.Tensor
-        Conditioning sample of shape ``(n, ...)``.
-
-    space_types : tuple of 3 strings, default=("euclidean", "euclidean", "euclidean")
-        Metric-space types for the ``X``, ``Y``, and ``Z`` components.
-
-    atol : float, default=1e-12
-        Absolute tolerance used in the indicator comparison.
-
-    GPU : bool, default=False
-        Whether the computation is carried out with PyTorch on CUDA.
-
-    Returns
-    -------
-    np.ndarray or torch.Tensor
-        A one-dimensional array/tensor of length ``B`` containing the
-        oracle product-form estimates.
-
-    Notes
-    -----
-    This routine assumes that all inputs have already been converted to the
-    appropriate backend representation prior to the function call.
-    """
-    if u_batch.shape != v_batch.shape:
-        raise ValueError(
-            f"u_batch and v_batch must have the same shape, but got "
-            f"{tuple(u_batch.shape)} and {tuple(v_batch.shape)}."
-        )
-
-    if u_batch.ndim < 3:
-        raise ValueError(
-            f"Expected u_batch and v_batch to have shape (B, 3, ...), "
-            f"but got {tuple(u_batch.shape)}."
-        )
-
-    B = u_batch.shape[0]
-    n = Z_array.shape[0]
-    M = X_orc_array.shape[1]
-
-    ux = u_batch[:, 0, ...]
-    uy = u_batch[:, 1, ...]
-    uz = u_batch[:, 2, ...]
-
-    vx = v_batch[:, 0, ...]
-    vy = v_batch[:, 1, ...]
-    vz = v_batch[:, 2, ...]
-
-    x_shape = tuple(ux.shape[1:])
-    y_shape = tuple(uy.shape[1:])
-    z_shape = tuple(uz.shape[1:])
-
-    # ------------------------------------------------------------
-    # X component
-    # ------------------------------------------------------------
-    if GPU:
-        ux_exp = ux[:, None, None, ...].expand(B, n, M, *x_shape)
-        vx_exp = vx[:, None, None, ...].expand(B, n, M, *x_shape)
-        X_exp = X_orc_array[None, :, :, ...].expand(B, n, M, *x_shape)
-    else:
-        x_batch_shape = (B, n, M) + x_shape
-        ux_exp = np.broadcast_to(ux[:, None, None, ...], x_batch_shape)
-        vx_exp = np.broadcast_to(vx[:, None, None, ...], x_batch_shape)
-        X_exp = np.broadcast_to(X_orc_array[None, :, :, ...], x_batch_shape)
-
-    dux = compute_distance(
-        ux_exp.reshape(B * n * M, *x_shape),
-        X_exp.reshape(B * n * M, *x_shape),
-        space_types[0],
-        GPU=GPU,
-    )
-    duv_x = compute_distance(
-        ux_exp.reshape(B * n * M, *x_shape),
-        vx_exp.reshape(B * n * M, *x_shape),
-        space_types[0],
-        GPU=GPU,
-    )
-
-    # ------------------------------------------------------------
-    # Y component
-    # ------------------------------------------------------------
-    if GPU:
-        uy_exp = uy[:, None, None, ...].expand(B, n, M, *y_shape)
-        vy_exp = vy[:, None, None, ...].expand(B, n, M, *y_shape)
-        Y_exp = Y_orc_array[None, :, :, ...].expand(B, n, M, *y_shape)
-    else:
-        y_batch_shape = (B, n, M) + y_shape
-        uy_exp = np.broadcast_to(uy[:, None, None, ...], y_batch_shape)
-        vy_exp = np.broadcast_to(vy[:, None, None, ...], y_batch_shape)
-        Y_exp = np.broadcast_to(Y_orc_array[None, :, :, ...], y_batch_shape)
-
-    duy = compute_distance(
-        uy_exp.reshape(B * n * M, *y_shape),
-        Y_exp.reshape(B * n * M, *y_shape),
-        space_types[1],
-        GPU=GPU,
-    )
-    duv_y = compute_distance(
-        uy_exp.reshape(B * n * M, *y_shape),
-        vy_exp.reshape(B * n * M, *y_shape),
-        space_types[1],
-        GPU=GPU,
-    )
-
-    # ------------------------------------------------------------
-    # Z component
-    # ------------------------------------------------------------
-    if GPU:
-        uz_exp = uz[:, None, ...].expand(B, n, *z_shape)
-        vz_exp = vz[:, None, ...].expand(B, n, *z_shape)
-        Z_exp = Z_array[None, :, ...].expand(B, n, *z_shape)
-    else:
-        z_batch_shape = (B, n) + z_shape
-        uz_exp = np.broadcast_to(uz[:, None, ...], z_batch_shape)
-        vz_exp = np.broadcast_to(vz[:, None, ...], z_batch_shape)
-        Z_exp = np.broadcast_to(Z_array[None, :, ...], z_batch_shape)
-
-    duz = compute_distance(
-        uz_exp.reshape(B * n, *z_shape),
-        Z_exp.reshape(B * n, *z_shape),
-        space_types[2],
-        GPU=GPU,
-    )
-    duv_z = compute_distance(
-        uz_exp.reshape(B * n, *z_shape),
-        vz_exp.reshape(B * n, *z_shape),
-        space_types[2],
-        GPU=GPU,
-    )
-
-    # ------------------------------------------------------------
-    # Aggregate
-    # ------------------------------------------------------------
-    if GPU:
-        dx = (dux <= duv_x + atol).reshape(B, n, M).to(torch.float32)
-        dy = (duy <= duv_y + atol).reshape(B, n, M).to(torch.float32)
-        dz = (duz <= duv_z + atol).reshape(B, n).to(torch.float32)
-
-        tx = dx.mean(dim=2)
-        ty = dy.mean(dim=2)
-        return (tx * ty * dz).mean(dim=1)
-
-    dx = (dux <= duv_x + atol).reshape(B, n, M).astype(float)
-    dy = (duy <= duv_y + atol).reshape(B, n, M).astype(float)
-    dz = (duz <= duv_z + atol).reshape(B, n).astype(float)
-
-    tx = dx.mean(axis=2)
-    ty = dy.mean(axis=2)
-    return (tx * ty * dz).mean(axis=1)
-
-
-# ============================================================
 # Test statistic
 # ------------------------------------------------------------
-# This section implements the main test statistic used in the
-# conditional independence procedure. The computation is carried
-# out over all ordered pairs ``(i, j)`` with ``i != j``, processed
-# in batches for memory efficiency.
+# This section computes the conditional independence test statistic
+# using observed samples and generated conditional samples.
 #
-# The statistic routine also serves as the entry point to the
-# GPU computation path: when GPU acceleration is requested,
-# NumPy inputs are converted internally to CUDA tensors, and
-# the dominant batched evaluations of ``\hat F_n^{\mathcal M}``
-# and ``\hat F_n^{M,\perp}`` are then carried out through PyTorch.
+# Shape convention:
+#   - Bundle_X.data, Bundle_Y.data, Bundle_Z.data:
+#       (n, d) for Euclidean / sphere
+#       (n, p, p) for SPD
+#   - Bundle_X_gen.data, Bundle_Y_gen.data:
+#       (n, M, d) or (n, M, p, p)
+#
+# Backend convention:
+#   - NumPy inputs use NumPy computation.
+#   - Torch inputs use torch computation on their existing device.
 # ============================================================
 
 
 def statistics(
-    X: np.ndarray,
-    Y: np.ndarray,
-    Z: np.ndarray,
-    X_orc_array: np.ndarray,
-    Y_orc_array: np.ndarray,
-    space_types: Tuple[str, str, str],
-    GPU: bool = False,
+    Bundle_X: DataBundle,
+    Bundle_Y: DataBundle,
+    Bundle_Z: DataBundle,
+    Bundle_X_gen: DataBundle,
+    Bundle_Y_gen: DataBundle,
+    atol: float = 1e-12,
     batch_size: int = 1024,
 ) -> float:
     r"""
-    Compute the statistic
-    \[
-    T_n^{\mathrm{gen}}
-    =
-    \frac{1}{n(n-1)}
-    \sum_{i \ne j}
-    \left[
-    \hat F_n^{\mathcal M}(u_i, u_j)
-    -
-    \hat F_n^{M,\perp}(u_i, u_j)
-    \right]^2.
-    \]
-
+    Compute the test statistic from observed and generated samples.
     Parameters
     ----------
-    X, Y, Z : np.ndarray
-        Observed samples in the three component spaces.
-
-    X_orc_array, Y_orc_array : np.ndarray
-        Oracle conditional samples of shape ``(n, M, ...)``, where ``M`` denotes
-        the number of generated samples per conditioning value.
-
-    space_types : tuple[str, str, str]
-        Metric-space types for the three components ``(X, Y, Z)``. These determine
-        the geometry used in the evaluation of both
-        ``\hat F_n^{\mathcal M}`` and ``\hat F_n^{M,\perp}``.
-
-    GPU : bool, default=False
-        If ``True``, all inputs are converted to CUDA tensors at the beginning of
-        the routine, and subsequent batched computations are carried out using
-        PyTorch on the GPU. Otherwise, computations are performed using NumPy.
-
+    Bundle_X, Bundle_Y, Bundle_Z : DataBundle
+        Observed samples with first dimension ``n``.
+    Bundle_X_gen, Bundle_Y_gen : DataBundle
+        Generated conditional samples with shape starting ``(n, M, ...)``.
+    atol : float, default=1e-12
+        Numerical tolerance used in distance comparisons.
     batch_size : int, default=1024
-        Number of ordered pairs ``(i, j)`` processed in each batch.
-
+        Number of ordered pairs ``(i, j)`` processed per batch.
     Returns
     -------
     float
-        The value of the test statistic.
-
-    Notes
-    -----
-    This routine serves as the main computational entry point of the test statistic.
-    All inputs are expected to be NumPy arrays; if GPU acceleration is requested,
-    they are converted internally to CUDA tensors. The computation over all ordered
-    pairs ``(i, j)`` with ``i \ne j`` is carried out in batches for memory efficiency.
-
-    The grouping structure required for evaluating
-    ``\hat F_n^{\mathcal M}`` is constructed internally from ``space_types``.
+        Test statistic value.
     """
-    n = len(X)
-    if n < 2:
-        raise ValueError("At least two observations are required.")
-    
-    if GPU:
-        X = torch.as_tensor(X, device="cuda", dtype=torch.float32)
-        Y = torch.as_tensor(Y, device="cuda", dtype=torch.float32)
-        Z = torch.as_tensor(Z, device="cuda", dtype=torch.float32)
-        X_orc_array = torch.as_tensor(X_orc_array, device="cuda", dtype=torch.float32)
-        Y_orc_array = torch.as_tensor(Y_orc_array, device="cuda", dtype=torch.float32)
 
-    component_groups = build_component_groups(space_types)
+    # ============================================================
+    # Basic backend information
+    # ============================================================
+    X_data = Bundle_X.data
+    n = X_data.shape[0]
+    M = Bundle_X_gen.data.shape[1]
 
-    S = stack_product_samples(X, Y, Z, GPU=GPU)
+    if isinstance(X_data, torch.Tensor):
+        backend_info = {
+            "backend": "torch",
+            "device": X_data.device,
+            "dtype": X_data.dtype,
+        }
+    elif isinstance(X_data, np.ndarray):
+        backend_info = {
+            "backend": "numpy",
+            "dtype": X_data.dtype,
+        }
+    else:
+        raise TypeError("Bundle_X.data must be np.ndarray or torch.Tensor.")
+
+    # ============================================================
+    # Precompute distances
+    # ============================================================
+    distance_dict = {
+        "d_x": compute_distance(
+            broadcast_pair_array(_main_left(Bundle_X), mode="ij"),
+            broadcast_pair_array(_main_right(Bundle_X), mode="ji"),
+            space_type=Bundle_X.space_type,
+        ),
+
+        "d_y": compute_distance(
+            broadcast_pair_array(_main_left(Bundle_Y), mode="ij"),
+            broadcast_pair_array(_main_right(Bundle_Y), mode="ji"),
+            space_type=Bundle_Y.space_type,
+        ),
+
+        "d_z": compute_distance(
+            broadcast_pair_array(_main_left(Bundle_Z), mode="ij"),
+            broadcast_pair_array(_main_right(Bundle_Z), mode="ji"),
+            space_type=Bundle_Z.space_type,
+        ),
+
+        "d_x_sim": compute_distance(
+            broadcast_pair_array(_main_left(Bundle_X), mode="ijm", rep=M),
+            broadcast_pair_array(_main_right(Bundle_X_gen), mode="jim"),
+            space_type=Bundle_X.space_type,
+        ),
+
+        "d_y_sim": compute_distance(
+            broadcast_pair_array(_main_left(Bundle_Y), mode="ijm", rep=M),
+            broadcast_pair_array(_main_right(Bundle_Y_gen), mode="jim"),
+            space_type=Bundle_Y.space_type,
+        ),
+    }
+
     total_pairs = n * (n - 1)
     total = 0.0
 
-    for start in range(0, total_pairs, batch_size):
-        end = min(start + batch_size, total_pairs)
-        bsz = end - start
+    # ============================================================
+    # Torch backend
+    # ============================================================
+    if backend_info["backend"] == "torch":
 
-        if GPU:
-            k = torch.arange(start, end, device=S.device, dtype=torch.long)
+        for start in range(0, total_pairs, batch_size):
+            end = min(start + batch_size, total_pairs)
+
+            k = torch.arange(start, end, device=backend_info["device"], dtype=torch.long)
             ib = torch.div(k, n - 1, rounding_mode="floor")
             r = torch.remainder(k, n - 1)
             jb = r + (r >= ib).to(torch.long)
 
-            u_batch = S[ib]
-            v_batch = S[jb]
-        else:
-            k = np.arange(start, end, dtype=np.int64)
-            ib = k // (n - 1)
-            r = k % (n - 1)
-            jb = r + (r >= ib).astype(np.int64)
+            dx_ij = distance_dict["d_x"][ib, jb]
+            dy_ij = distance_dict["d_y"][ib, jb]
+            dz_ij = distance_dict["d_z"][ib, jb]
 
-            u_batch = S[ib]
-            v_batch = S[jb]
+            emdf_P = (
+                (distance_dict["d_x"][ib, :] <= dx_ij[:, None] + atol)
+                & (distance_dict["d_y"][ib, :] <= dy_ij[:, None] + atol)
+                & (distance_dict["d_z"][ib, :] <= dz_ij[:, None] + atol)
+            ).to(backend_info["dtype"]).mean(dim=1)
 
-        emdf_P = emdf_product_pair_batch(
-            xyz_samples=S,
-            u_batch=u_batch,
-            v_batch=v_batch,
-            component_groups=component_groups,
-            atol=1e-12,
-            GPU=GPU,
-        )
+            tx = (
+                distance_dict["d_x_sim"][ib, :, :] <= dx_ij[:, None, None] + atol
+            ).to(backend_info["dtype"]).mean(dim=2)
 
-        emdf_I = f_perp_gen_pair_batch(
-            u_batch=u_batch,
-            v_batch=v_batch,
-            X_orc_array=X_orc_array,
-            Y_orc_array=Y_orc_array,
-            Z_array=Z,
-            space_types=space_types,
-            atol=1e-12,
-            GPU=GPU,
-        )
+            ty = (
+                distance_dict["d_y_sim"][ib, :, :] <= dy_ij[:, None, None] + atol
+            ).to(backend_info["dtype"]).mean(dim=2)
 
-        if GPU:
+            dz = (
+                distance_dict["d_z"][ib, :] <= dz_ij[:, None] + atol
+            ).to(backend_info["dtype"])
+
+            emdf_I = (tx * ty * dz).mean(dim=1)
+
             diff = emdf_P - emdf_I
             total += float((diff * diff).sum().item())
-        else:
-            diff = emdf_P - emdf_I
-            total += float(np.sum(diff * diff))
 
-    return total / (n * (n - 1))
+        return total / total_pairs
+
+    # ============================================================
+    # NumPy backend
+    # ============================================================
+    for start in range(0, total_pairs, batch_size):
+        end = min(start + batch_size, total_pairs)
+
+        k = np.arange(start, end, dtype=np.int64)
+        ib = k // (n - 1)
+        r = k % (n - 1)
+        jb = r + (r >= ib)
+
+        dx_ij = distance_dict["d_x"][ib, jb]
+        dy_ij = distance_dict["d_y"][ib, jb]
+        dz_ij = distance_dict["d_z"][ib, jb]
+
+        emdf_P = (
+            (distance_dict["d_x"][ib, :] <= dx_ij[:, None] + atol)
+            & (distance_dict["d_y"][ib, :] <= dy_ij[:, None] + atol)
+            & (distance_dict["d_z"][ib, :] <= dz_ij[:, None] + atol)
+        ).astype(backend_info["dtype"]).mean(axis=1)
+
+        tx = (
+            distance_dict["d_x_sim"][ib, :, :] <= dx_ij[:, None, None] + atol
+        ).astype(backend_info["dtype"]).mean(axis=2)
+
+        ty = (
+            distance_dict["d_y_sim"][ib, :, :] <= dy_ij[:, None, None] + atol
+        ).astype(backend_info["dtype"]).mean(axis=2)
+
+        dz = (
+            distance_dict["d_z"][ib, :] <= dz_ij[:, None] + atol
+        ).astype(backend_info["dtype"])
+
+        emdf_I = (tx * ty * dz).mean(axis=1)
+
+        diff = emdf_P - emdf_I
+        total += float(np.sum(diff * diff))
+
+    return total / total_pairs
 
 
 # ============================================================
-# Local permutation
+# Local permutation utilities
 # ------------------------------------------------------------
-# This part is kept mostly on CPU.
-# Neighbor search and permutation logic are not the main bottleneck.
+# This section implements the local permutation procedure used
+# for conditional independence testing on metric-space data.
+#
+# Main components:
+#   1. compute_pairwise_distances:
+#      compute the pairwise distance matrix of conditioning samples.
+#
+#   2. build_knn_indices:
+#      construct local neighborhoods from the pairwise distance matrix.
+#
+#   3. local_permute_y:
+#      generate locally permuted indices for Y using the KNN sets.
+#
+#   4. local_permutation_test:
+#      run the full permutation test using repeated local permutations.
+#
+# Backend convention:
+#   - NumPy input bundles use NumPy arrays and np.random.Generator.
+#   - Torch input bundles use torch tensors and torch.Generator.
 # ============================================================
 
 
 def compute_pairwise_distances(
-    Z: np.ndarray,
-    z_space_type: Literal["euclidean", "sphere", "spd"],
-) -> np.ndarray:
+    Bundle_Z: DataBundle,
+    batch_size: int | None = None,
+) -> Union[np.ndarray, torch.Tensor]:
     r"""
-    Compute the pairwise distance matrix on a supported metric space.
+    Compute the pairwise distance matrix for conditioning samples.
 
     Parameters
     ----------
-    Z : np.ndarray
-        Input sample.
+    Bundle_Z : DataBundle
+        Conditioning sample bundle.
 
-        - For Euclidean and spherical spaces: shape ``(n, d)``;
-        - For SPD space: shape ``(n, p, p)``.
+        Shape of ``Bundle_Z.data``:
+        - Euclidean / sphere: ``(n, d)``
+        - SPD: ``(n, p, p)``
 
-    z_space_type : {"euclidean", "sphere", "spd"}
-        Metric-space type of the sample.
+    batch_size : int or None, default=None
+        Number of upper-triangular pairs processed per batch.
+        If ``None``, all pairs are processed at once.
 
     Returns
     -------
-    np.ndarray
+    np.ndarray or torch.Tensor
         Pairwise distance matrix of shape ``(n, n)``.
-
-    Raises
-    ------
-    ValueError
-        If the input shape is incompatible with ``z_space_type``, or if the
-        sample is empty.
-
-    Notes
-    -----
-    The implementation uses fully vectorized formulas for Euclidean and
-    spherical spaces. For the SPD case equipped with the Cholesky distance,
-    the computation is reduced to a Euclidean distance matrix after mapping
-    each SPD matrix to its Cholesky factor.
     """
-    Z = np.asarray(Z, dtype=float)
-    n = Z.shape[0]
 
-    if n == 0:
-        raise ValueError("Z must be non-empty.")
+    Z_data = Bundle_Z.data
+    
+    n = Z_data.shape[0]
 
-    # ------------------------------------------------------------
-    # Case 1: Euclidean space
-    # ------------------------------------------------------------
-    if z_space_type == "euclidean":
-        if Z.ndim != 2:
-            raise ValueError(
-                f"For Euclidean space, expected Z.shape = (n, d), but got {Z.shape}."
+    if isinstance(Z_data, torch.Tensor):
+        backend = "torch"
+        device = Z_data.device
+        dtype = Z_data.dtype
+
+    elif isinstance(Z_data, np.ndarray):
+        backend = "numpy"
+        dtype = Z_data.dtype
+    else:
+        raise TypeError("Bundle_X.data must be np.ndarray or torch.Tensor.")
+
+    n_total = n * (n - 1) // 2
+
+    # ============================================================
+    # Torch backend
+    # ============================================================
+    if backend == "torch":
+        D = torch.zeros((n, n), device=device, dtype=dtype)
+        if n_total == 0:
+            return D
+        if batch_size is None:
+            batch_size = n_total
+        row_idx, col_idx = torch.triu_indices(
+            n,
+            n,
+            offset=1,
+            device=device,
+        )
+        for start in range(0, n_total, batch_size):
+            end = min(start + batch_size, n_total)
+
+            i_idx = row_idx[start:end]
+            j_idx = col_idx[start:end]
+
+            d_ij = compute_distance(
+                _main_left(Bundle_Z.slice(i_idx)),
+                _main_right(Bundle_Z.slice(j_idx)),
+                space_type=Bundle_Z.space_type,
             )
 
-        sq_norms = np.sum(Z * Z, axis=1, keepdims=True)
-        D2 = sq_norms + sq_norms.T - 2.0 * (Z @ Z.T)
-        D2 = np.maximum(D2, 0.0)
+            D[i_idx, j_idx] = d_ij
+            D[j_idx, i_idx] = d_ij
 
-        return np.sqrt(D2)
+        return D
 
-    # ------------------------------------------------------------
-    # Case 2: Spherical space
-    # ------------------------------------------------------------
-    if z_space_type == "sphere":
-        if Z.ndim != 2:
-            raise ValueError(
-                f"For sphere space, expected Z.shape = (n, d), but got {Z.shape}."
+    # ============================================================
+    # NumPy backend
+    # ============================================================
+    if backend == "numpy":
+        D = np.zeros((n, n), dtype=dtype)
+        if n_total == 0:
+            return D
+        if batch_size is None:
+            batch_size = n_total
+        row_idx, col_idx = np.triu_indices(
+            n,
+            k=1,
+        )
+
+        for start in range(0, n_total, batch_size):
+            end = min(start + batch_size, n_total)
+
+            i_idx = row_idx[start:end]
+            j_idx = col_idx[start:end]
+
+            d_ij = compute_distance(
+                _main_left(Bundle_Z.slice(i_idx)),
+                _main_right(Bundle_Z.slice(j_idx)),
+                space_type=Bundle_Z.space_type,
             )
 
-        norms = np.linalg.norm(Z, axis=1, keepdims=True)
-        if np.any(norms <= 0.0):
-            raise ValueError("Sphere inputs must have nonzero norm.")
+            D[i_idx, j_idx] = d_ij
+            D[j_idx, i_idx] = d_ij
 
-        Z_unit = Z / norms
-        cos_theta = Z_unit @ Z_unit.T
-        cos_theta = np.clip(cos_theta, -1.0, 1.0)
-
-        return np.arccos(cos_theta)
-
-    # ------------------------------------------------------------
-    # Case 3: SPD space
-    # ------------------------------------------------------------
-    if z_space_type == "spd":
-        if Z.ndim != 3 or Z.shape[1] != Z.shape[2]:
-            raise ValueError(
-                f"For SPD space, expected Z.shape = (n, p, p), but got {Z.shape}."
-            )
-
-        # Cholesky factors: shape (n, p, p)
-        L = np.linalg.cholesky(Z)
-
-        # Flatten each factor into a vector in R^(p^2)
-        L_flat = L.reshape(n, -1)
-
-        # Frobenius distances between Cholesky factors
-        sq_norms = np.sum(L_flat * L_flat, axis=1, keepdims=True)
-        D2 = sq_norms + sq_norms.T - 2.0 * (L_flat @ L_flat.T)
-        D2 = np.maximum(D2, 0.0)
-
-        return np.sqrt(D2)
-
-    raise ValueError("z_space_type must be one of {'euclidean', 'sphere', 'spd'}.")
+        return D
 
 
 def build_knn_indices(
-    Z: Union[np.ndarray, list[np.ndarray]],
+    Bundle_Z: DataBundle,
     k: int,
-    z_space_type: Literal["euclidean", "sphere", "spd"],
     include_self: bool = True,
-) -> np.ndarray:
+    batch_size: int | None = None,
+) -> Union[np.ndarray, torch.Tensor]:
     r"""
-    Construct k-nearest-neighbor index sets in the Z-space.
+    Build k-nearest-neighbor indices from conditioning samples.
 
     Parameters
     ----------
-    Z : np.ndarray or list[np.ndarray]
-        Sample in the conditioning space.
+    Bundle_Z : DataBundle
+        Conditioning sample bundle with first dimension ``n``.
 
     k : int
-        Number of nearest neighbors to retain.
-
-    z_space_type : {"euclidean", "sphere", "spd"}
-        Metric-space type of the conditioning variable.
+        Number of neighbors.
 
     include_self : bool, default=True
-        Whether each point is allowed to include itself among its neighbors.
+        Whether each point may include itself as a neighbor.
+
+    batch_size : int or None, default=None
+        Batch size used when computing pairwise distances.
 
     Returns
     -------
-    np.ndarray
-        Array of shape ``(n, k)`` whose ``i``-th row contains the indices of
-        the ``k`` nearest neighbors of the ``i``-th point.
-
-    Notes
-    -----
-    The pairwise distance matrix is first computed in full. Neighbor selection
-    is then carried out row-wise using partial sorting, which is more efficient
-    than a full sort when only the first ``k`` nearest neighbors are needed.
+    np.ndarray or torch.Tensor
+        Neighbor indices of shape ``(n, k)``.
     """
-    D = compute_pairwise_distances(Z, z_space_type)
-    n = D.shape[0]
+    if not isinstance(Bundle_Z, DataBundle):
+        raise TypeError("Bundle_Z must be a DataBundle.")
 
     if k < 1:
         raise ValueError("k must be at least 1.")
+
+    D = compute_pairwise_distances(
+        Bundle_Z=Bundle_Z,
+        batch_size=batch_size,
+    )
+
+    n = D.shape[0]
 
     if include_self:
         if k > n:
@@ -874,292 +715,413 @@ def build_knn_indices(
     else:
         if k >= n:
             raise ValueError(
-                f"When include_self=False, k={k} must be smaller than n={n}, "
-                "since each point has at most n-1 non-self neighbors."
+                f"When include_self=False, k={k} must be smaller than n={n}."
             )
 
-    if include_self:
-        # Partial sort: extract the k smallest entries in each row.
-        cand = np.argpartition(D, kth=k - 1, axis=1)[:, :k]
+    # ============================================================
+    # Torch backend
+    # ============================================================
+    if isinstance(D, torch.Tensor):
 
-        # Sort these k candidates by their actual distances.
-        row_idx = np.arange(n)[:, None]
-        cand_dist = D[row_idx, cand]
-        order = np.argsort(cand_dist, axis=1)
+        if not include_self:
+            diag_idx = torch.arange(n, device=D.device)
+            D[diag_idx, diag_idx] = torch.inf
 
-        return cand[row_idx, order]
+        cand = torch.topk(
+            D,
+            k=k,
+            dim=1,
+            largest=False,
+        ).indices
 
-    # Exclude self by setting diagonal to +inf.
-    D_work = D.copy()
-    np.fill_diagonal(D_work, np.inf)
+        cand_dist = torch.gather(
+            D,
+            dim=1,
+            index=cand,
+        )
 
-    cand = np.argpartition(D_work, kth=k - 1, axis=1)[:, :k]
+        order = torch.argsort(
+            cand_dist,
+            dim=1,
+        )
 
-    row_idx = np.arange(n)[:, None]
-    cand_dist = D_work[row_idx, cand]
-    order = np.argsort(cand_dist, axis=1)
+        return torch.gather(
+            cand,
+            dim=1,
+            index=order,
+        )
 
-    return cand[row_idx, order]
+    # ============================================================
+    # NumPy backend
+    # ============================================================
+    if isinstance(D, np.ndarray):
 
+        if not include_self:
+            diag_idx = np.arange(n)
+            D[diag_idx, diag_idx] = np.inf
 
-# def local_permute_y(
-#     Y: np.ndarray,
-#     knn_indices: np.ndarray,
-#     rng: Optional[np.random.Generator] = None,
-#     strategy: str = "resample",
-# ) -> np.ndarray:
-#     r"""
-#     Construct a locally permuted version of Y.
+        cand = np.argpartition(
+            D,
+            kth=k - 1,
+            axis=1,
+        )[:, :k]
 
-#     Parameters
-#     ----------
-#     Y : np.ndarray
-#         Sample to be locally permuted. The first dimension is interpreted as
-#         the sample index.
+        cand_dist = np.take_along_axis(
+            D,
+            cand,
+            axis=1,
+        )
 
-#     knn_indices : np.ndarray
-#         Array of shape (n, k) whose i-th row contains the admissible
-#         neighbor indices associated with the i-th observation.
+        order = np.argsort(
+            cand_dist,
+            axis=1,
+        )
 
-#     rng : np.random.Generator or None, default=None
-#         Random number generator. If None, a default generator is used.
+        return np.take_along_axis(
+            cand,
+            order,
+            axis=1,
+        ).astype(np.int64, copy=False)
 
-#     strategy : {"resample", "shuffle_once"}, default="resample"
-#         Local permutation strategy.
-
-#     Returns
-#     -------
-#     np.ndarray
-#         Locally permuted version of Y with the same shape as Y.
-#     """
-#     if rng is None:
-#         rng = np.random.default_rng()
-
-#     n = Y.shape[0]
-
-#     if knn_indices.ndim != 2:
-#         raise ValueError(
-#             f"knn_indices must have shape (n, k), but got {knn_indices.shape}."
-#         )
-
-#     if knn_indices.shape[0] != n:
-#         raise ValueError("knn_indices and Y must have the same first dimension.")
-
-#     if knn_indices.shape[1] == 0:
-#         raise ValueError("Each row of knn_indices must contain at least one neighbor.")
-
-#     if strategy not in {"resample", "shuffle_once"}:
-#         raise ValueError("strategy must be one of {'resample', 'shuffle_once'}.")
-
-#     # ------------------------------------------------------------
-#     # Strategy 1: independent local resampling
-#     # ------------------------------------------------------------
-#     if strategy == "resample":
-#         k = knn_indices.shape[1]
-#         chosen = knn_indices[np.arange(n), rng.integers(0, k, size=n)]
-#         return Y[chosen].copy()
-
-#     # ------------------------------------------------------------
-#     # Strategy 2: one-pass constrained shuffle with fallback
-#     # ------------------------------------------------------------
-#     perm = rng.permutation(n)
-
-#     # rank[j] = position of index j in perm
-#     rank = np.empty(n, dtype=int)
-#     rank[perm] = np.arange(n)
-
-#     available = np.ones(n, dtype=bool)
-#     chosen = np.empty(n, dtype=int)
-
-#     for i in range(n):
-#         neigh = knn_indices[i]
-#         feasible = neigh[available[neigh]]
-
-#         if feasible.size > 0:
-#             selected = feasible[np.argmin(rank[feasible])]
-#             chosen[i] = selected
-#             available[selected] = False
-#         else:
-#             chosen[i] = neigh[rng.integers(0, len(neigh))]
-
-#     return Y[chosen].copy()
+    raise TypeError("Distance matrix must be np.ndarray or torch.Tensor.")
 
 
 def local_permute_y(
-    Y: np.ndarray,
-    knn_indices: np.ndarray,
-    rng: Optional[np.random.Generator] = None,
+    Bundle_Y: DataBundle,
+    knn_indices: Union[np.ndarray, torch.Tensor],
+    generator: np.random.Generator | torch.Generator | None = None,
     strategy: str = "resample",
-) -> np.ndarray:
+) -> Union[np.ndarray, torch.Tensor]:
     r"""
-    Construct a locally permuted version of ``Y``.
+    Generate locally permuted indices for ``Y``.
 
     Parameters
     ----------
-    Y : np.ndarray
-        Sample to be locally permuted. The first dimension is interpreted as
-        the sample index.
+    Bundle_Y : DataBundle
+        Data bundle for ``Y`` with first dimension ``n``.
 
-    knn_indices : np.ndarray
-        Array of shape ``(n, k)`` whose ``i``-th row contains the admissible
-        neighbor indices associated with the ``i``-th observation.
+    knn_indices : np.ndarray or torch.Tensor
+        Neighbor index array of shape ``(n, k)``.
 
-    rng : np.random.Generator or None, default=None
-        Random number generator. If ``None``, a default generator is used.
+    generator : np.random.Generator, torch.Generator, or None, default=None
+        Random number generator matching the backend.
 
     strategy : {"resample", "shuffle_once"}, default="resample"
         Local permutation strategy.
 
     Returns
     -------
-    np.ndarray
-        Locally permuted version of ``Y`` with the same shape as ``Y``.
+    np.ndarray or torch.Tensor
+        Chosen permutation indices of shape ``(n,)``.
     """
-    if rng is None:
-        rng = np.random.default_rng()
 
+    if not isinstance(Bundle_Y, DataBundle):
+        raise TypeError("Bundle_Y must be a DataBundle.")
+
+    Y = Bundle_Y.data
     n = Y.shape[0]
+        
+    if not isinstance(knn_indices, (np.ndarray, torch.Tensor)):
+        raise TypeError("knn_indices must be np.ndarray or torch.Tensor.")
 
     if knn_indices.ndim != 2:
         raise ValueError(
-            f"knn_indices must have shape (n, k), but got {knn_indices.shape}."
+            f"knn_indices must have shape (n, k), got {tuple(knn_indices.shape)}."
         )
 
     if knn_indices.shape[0] != n:
-        raise ValueError("knn_indices and Y must have the same first dimension.")
+        raise ValueError("knn_indices and Bundle_Y must have the same first dimension.")
 
-    if knn_indices.shape[1] == 0:
+    k = knn_indices.shape[1]
+
+    if k == 0:
         raise ValueError("Each row of knn_indices must contain at least one neighbor.")
 
-    if strategy not in {"resample", "shuffle_once"}:
+    # ============================================================
+    # Torch backend
+    # ============================================================
+    if isinstance(Y, torch.Tensor):
+
+        if not isinstance(knn_indices, torch.Tensor):
+            raise TypeError("For torch Bundle_Y, knn_indices must be torch.Tensor.")
+
+        if knn_indices.device != Y.device:
+            raise ValueError("knn_indices must be on the same device as Bundle_Y.data.")
+
+        if knn_indices.dtype != torch.long:
+            raise ValueError("knn_indices must have dtype torch.long.")
+
+        device = Y.device
+
+        if generator is None:
+            generator = torch.Generator(device=device)
+        elif not isinstance(generator, torch.Generator):
+            raise TypeError("For torch backend, generator must be torch.Generator or None.")
+
+        if strategy == "resample":
+            rand_col = torch.randint(
+                low=0,
+                high=k,
+                size=(n,),
+                device=device,
+                generator=generator,
+            )
+
+            row_idx = torch.arange(n, device=device)
+            chosen = knn_indices[row_idx, rand_col]
+
+            return chosen
+        
+        elif strategy == "shuffle_once":
+            perm = torch.randperm(n, device=device, generator=generator)
+
+            rank = torch.empty(n, device=device, dtype=torch.long)
+            rank[perm] = torch.arange(n, device=device, dtype=torch.long)
+
+            available = torch.ones(n, device=device, dtype=torch.bool)
+            chosen = torch.empty(n, device=device, dtype=torch.long)
+
+            last_selected: int | None = None
+
+            for i in range(n):
+                neigh = knn_indices[i]
+                feasible = neigh[available[neigh]]
+
+                if feasible.numel() > 0:
+                    selected = feasible[torch.argmin(rank[feasible])]
+                    chosen[i] = selected
+                    available[selected] = False
+                    last_selected = int(selected.item())
+                else:
+                    if last_selected is not None:
+                        chosen[i] = last_selected
+                    else:
+                        rand_pos = torch.randint(
+                            low=0,
+                            high=neigh.numel(),
+                            size=(1,),
+                            device=device,
+                            generator=generator,
+                        )
+                        chosen[i] = neigh[rand_pos.item()]
+
+            return chosen
+        
         raise ValueError("strategy must be one of {'resample', 'shuffle_once'}.")
 
-    # ------------------------------------------------------------
-    # Strategy 1: independent local resampling
-    # ------------------------------------------------------------
-    if strategy == "resample":
-        k = knn_indices.shape[1]
-        chosen = knn_indices[np.arange(n), rng.integers(0, k, size=n)]
-        return Y[chosen].copy()
+    # ============================================================
+    # NumPy backend
+    # ============================================================
+    elif isinstance(Y, np.ndarray):
 
-    # ------------------------------------------------------------
-    # Strategy 2: one-pass constrained shuffle with fallback
-    # ------------------------------------------------------------
-    perm = rng.permutation(n)
+        if not isinstance(knn_indices, np.ndarray):
+            raise TypeError("For NumPy Bundle_Y, knn_indices must be np.ndarray.")
 
-    rank = np.empty(n, dtype=int)
-    rank[perm] = np.arange(n)
+        if not np.issubdtype(knn_indices.dtype, np.integer):
+            raise ValueError("knn_indices must have integer dtype.")
 
-    available = np.ones(n, dtype=bool)
-    chosen = np.empty(n, dtype=int)
+        if generator is None:
+            generator = np.random.default_rng()
+        elif not isinstance(generator, np.random.Generator):
+            raise TypeError("For NumPy backend, generator must be np.random.Generator or None.")
 
-    last_selected: Optional[int] = None
+        if strategy == "resample":
+            rand_col = generator.integers(
+                low=0,
+                high=k,
+                size=n,
+            )
 
-    for i in range(n):
-        neigh = knn_indices[i]
-        feasible = neigh[available[neigh]]
+            row_idx = np.arange(n)
+            chosen = knn_indices[row_idx, rand_col]
 
-        if feasible.size > 0:
-            selected = feasible[np.argmin(rank[feasible])]
-            chosen[i] = selected
-            available[selected] = False
-            last_selected = selected
-        else:
-            if last_selected is not None:
-                chosen[i] = last_selected
-            else:
-                # 极端情形：第一次就无可用邻居时，退回本地随机选择
-                chosen[i] = neigh[rng.integers(0, len(neigh))]
+            return chosen
+        
+        elif strategy == "shuffle_once":
 
-    return Y[chosen].copy()
+            perm = generator.permutation(n)
+
+            rank = np.empty(n, dtype=np.int64)
+            rank[perm] = np.arange(n, dtype=np.int64)
+
+            available = np.ones(n, dtype=bool)
+            chosen = np.empty(n, dtype=np.int64)
+
+            last_selected: int | None = None
+
+            for i in range(n):
+                neigh = knn_indices[i]
+                feasible = neigh[available[neigh]]
+
+                if feasible.size > 0:
+                    selected = feasible[np.argmin(rank[feasible])]
+                    chosen[i] = selected
+                    available[selected] = False
+                    last_selected = int(selected)
+                else:
+                    if last_selected is not None:
+                        chosen[i] = last_selected
+                    else:
+                        rand_pos = generator.integers(
+                            low=0,
+                            high=neigh.size,
+                        )
+                        chosen[i] = neigh[rand_pos]
+
+            return chosen
+        
+        raise ValueError("strategy must be one of {'resample', 'shuffle_once'}.")
+
+    raise TypeError("Bundle_Y.data must be np.ndarray or torch.Tensor.")
 
 
 def local_permutation_test(
-    X,
-    Y,
-    Z,
+    Bundle_X: DataBundle,
+    Bundle_Y: DataBundle,
+    Bundle_Z: DataBundle,
     stat_fn: Callable[..., float],
     stat_kwargs: Optional[Dict] = None,
     B: int = 500,
     k: Optional[int] = None,
-    z_space_type: str = "euclidean",
     permutation_strategy: str = "resample",
     alpha: float = 0.05,
-    seed: Optional[int] = None,
+    generator: np.random.Generator | torch.Generator | None = None,
     show_progress: bool = False,
+    knn_batch_size: int | None = None,
 ) -> Dict[str, object]:
-    """
-    Generic local permutation test core.
+    r"""
+    Perform a local permutation test.
 
     Parameters
     ----------
-    X, Y, Z : array-like
-        Observed samples.
+    Bundle_X, Bundle_Y, Bundle_Z : DataBundle
+        Observed data bundles with shared first dimension ``n``.
 
     stat_fn : callable
-        Function that computes the test statistic from X, Y, Z.
-        Expected signature:
-            stat_fn(X, Y, Z, **stat_kwargs) -> float
+        Test statistic function.
 
-    stat_kwargs : dict, optional
-        Extra keyword arguments passed to stat_fn.
+    stat_kwargs : dict or None, default=None
+        Additional arguments passed to ``stat_fn``.
 
     B : int, default=500
-        Number of local permutation replicates.
+        Number of permutation replicates.
 
-    k : int, optional
-        Neighborhood size. If None, use max(10, ceil(sqrt(n))).
+    k : int or None, default=None
+        Neighborhood size. If ``None``, uses ``max(10, ceil(sqrt(n)))``.
 
-    z_space_type : str, default="euclidean"
-        One of {"euclidean", "sphere", "spd"}.
-
-    permutation_strategy : str, default="resample"
-        One of {"resample", "shuffle_once"}.
+    permutation_strategy : {"resample", "shuffle_once"}, default="resample"
+        Strategy used by ``local_permute_y``.
 
     alpha : float, default=0.05
         Significance level.
 
-    seed : int, optional
-        Random seed.
+    generator : np.random.Generator, torch.Generator, or None, default=None
+        Random number generator matching the backend.
 
     show_progress : bool, default=False
-        Whether to display a tqdm progress bar for the permutation loop.
+        Whether to show a progress bar.
+
+    knn_batch_size : int or None, default=None
+        Batch size for KNN distance computation.
 
     Returns
     -------
-    result : dict
-        {
-            "T_obs": float,
-            "T_perm": np.ndarray of shape (B,),
-            "p_value": float,
-            "reject": bool,
-            "k": int,
-            "knn_indices": np.ndarray
-        }
+    dict
+        Test result containing ``T_obs``, ``T_perm``, ``p_value``,
+        ``reject``, ``k``, and ``knn_indices``.
     """
+
     if stat_kwargs is None:
         stat_kwargs = {}
 
-    rng = np.random.default_rng(seed)
-    n = len(Z)
+    if not isinstance(Bundle_X, DataBundle):
+        raise TypeError("Bundle_X must be a DataBundle.")
+    if not isinstance(Bundle_Y, DataBundle):
+        raise TypeError("Bundle_Y must be a DataBundle.")
+    if not isinstance(Bundle_Z, DataBundle):
+        raise TypeError("Bundle_Z must be a DataBundle.")
+
+    if Bundle_X.data.shape[0] != Bundle_Y.data.shape[0] or Bundle_X.data.shape[0] != Bundle_Z.data.shape[0]:
+        raise ValueError("Bundle_X, Bundle_Y, and Bundle_Z must have the same sample size.")
+
+    if Bundle_X.space_type != Bundle_Y.space_type or Bundle_X.space_type != Bundle_Z.space_type:
+        raise ValueError("Bundle_X, Bundle_Y, and Bundle_Z must have the same space_type.")
+
+    Z_data = Bundle_Z.data
+    n = Z_data.shape[0]
+
+    if n < 2:
+        raise ValueError("At least two observations are required.")
+
+    if B <= 0:
+        raise ValueError("B must be positive.")
 
     if k is None:
-        k = max(10, int(np.ceil(np.sqrt(n))))
+        k = max(10, int(np.ceil(np.sqrt(float(n)))))
 
-    # 与 build_knn_indices 的约束保持一致
     if k >= n:
         k = n - 1
 
+    if k < 1:
+        raise ValueError("k must be at least 1 after adjustment.")
+
+    # ============================================================
+    # Backend setup
+    # ============================================================
+
+    if isinstance(Z_data, torch.Tensor):
+
+        device = Z_data.device
+        dtype = Z_data.dtype
+
+        if generator is None:
+            generator = torch.Generator(device=device)
+        elif not isinstance(generator, torch.Generator):
+            raise TypeError("For torch backend, generator must be torch.Generator or None.")
+
+        T_perm = torch.empty((B,), device=device, dtype=dtype)
+
+    elif isinstance(Z_data, np.ndarray):
+
+        dtype = Z_data.dtype
+
+        if generator is None:
+            generator = np.random.default_rng()
+        elif not isinstance(generator, np.random.Generator):
+            raise TypeError("For NumPy backend, generator must be np.random.Generator or None.")
+
+        T_perm = np.empty((B,), dtype=dtype)
+
+    else:
+        raise TypeError("Bundle_Z.data must be np.ndarray or torch.Tensor.")
+
+    # ============================================================
+    # KNN construction
+    # ============================================================
+
     knn_indices = build_knn_indices(
-        Z=Z,
+        Bundle_Z=Bundle_Z,
         k=k,
-        z_space_type=z_space_type,
         include_self=False,
+        batch_size=knn_batch_size,
     )
 
-    T_obs = stat_fn(X, Y, Z, **stat_kwargs)
+    # ============================================================
+    # Observed statistic
+    # ============================================================
 
-    T_perm = np.zeros(B, dtype=float)
+    T_obs = stat_fn(
+        Bundle_X,
+        Bundle_Y,
+        Bundle_Z,
+        **stat_kwargs,
+    )
+
+    T_obs_float = float(T_obs.item()) if isinstance(T_obs, torch.Tensor) else float(T_obs)
+
+    # ============================================================
+    # Permutation statistics
+    # ============================================================
 
     iterator = range(B)
     if show_progress:
@@ -1167,119 +1129,591 @@ def local_permutation_test(
         iterator = tqdm(iterator, desc="Permutation", leave=False)
 
     for b in iterator:
-        Y_star = local_permute_y(
-            Y=Y,
+        perm_index = local_permute_y(
+            Bundle_Y=Bundle_Y,
             knn_indices=knn_indices,
-            rng=rng,
+            generator=generator,
             strategy=permutation_strategy,
         )
-        T_perm[b] = stat_fn(X, Y_star, Z, **stat_kwargs)
 
-    p_value = (1.0 + np.sum(T_perm >= T_obs)) / (B + 1.0)
+        Bundle_Y_star = Bundle_Y.slice(perm_index)
+
+        Tb = stat_fn(
+            Bundle_X,
+            Bundle_Y_star,
+            Bundle_Z,
+            **stat_kwargs,
+        )
+
+        if isinstance(T_perm, torch.Tensor):
+            T_perm[b] = Tb if isinstance(Tb, torch.Tensor) else float(Tb)
+        else:
+            T_perm[b] = float(Tb.item()) if isinstance(Tb, torch.Tensor) else float(Tb)
+
+    # ============================================================
+    # P-value
+    # ============================================================
+
+    if isinstance(T_perm, torch.Tensor):
+        p_value_tensor = (
+            1.0 + torch.sum(T_perm >= T_obs_float).to(dtype=dtype)
+        ) / (B + 1.0)
+
+        p_value = float(p_value_tensor.item())
+
+    else:
+        p_value = float(
+            (1.0 + np.sum(T_perm >= T_obs_float)) / (B + 1.0)
+        )
 
     return {
-        "T_obs": float(T_obs),
+        "T_obs": T_obs_float,
         "T_perm": T_perm,
-        "p_value": float(p_value),
+        "p_value": p_value,
         "reject": bool(p_value <= alpha),
         "k": int(k),
         "knn_indices": knn_indices,
     }
 
 
-def local_permutation_test_time(
-    X,
-    Y,
-    Z,
-    stat_fn: Callable[..., float],
-    stat_kwargs: Optional[Dict] = None,
-    B: int = 500,
-    k: Optional[int] = None,
-    z_space_type: str = "euclidean",
-    permutation_strategy: str = "resample",
-    alpha: float = 0.05,
-    seed: Optional[int] = None,
-    show_progress: bool = False,
-) -> Dict[str, object]:
-    """
-    Generic local permutation test core.
+# ============================================================
+# Optimized local permutation statistic
+# ------------------------------------------------------------
+# This section implements an optimized local permutation test.
+#
+# The observed statistic is computed once by ``statistics_obs``.
+# During this step, distance matrices and reusable components of
+# the independence empirical distribution are cached.
+#
+# Each permutation replicate then calls ``statistics_perm``, which
+# reuses the cached quantities and only updates the parts affected
+# by the local permutation of Y.
+#
+# Shape convention:
+#   - Observed bundles:
+#       (n, d) for Euclidean / sphere
+#       (n, p, p) for SPD
+#   - Generated bundles:
+#       (n, M, d) or (n, M, p, p)
+#
+# Backend convention:
+#   - NumPy bundles use NumPy arrays.
+#   - Torch bundles use torch tensors on their existing device.
+# ============================================================
+
+
+def statistics_obs(
+    Bundle_X: DataBundle,
+    Bundle_Y: DataBundle,
+    Bundle_Z: DataBundle,
+    Bundle_X_gen: DataBundle,
+    Bundle_Y_gen: DataBundle,
+    atol: float = 1e-12,
+    batch_size: int = 1024,
+):
+    r"""
+    Compute the observed statistic and cache reusable quantities.
 
     Parameters
     ----------
-    X, Y, Z : array-like
-        Observed samples.
+    Bundle_X, Bundle_Y, Bundle_Z : DataBundle
+        Observed samples with first dimension ``n``.
 
-    stat_fn : callable
-        Function that computes the test statistic from X, Y, Z.
-        Expected signature:
-            stat_fn(X, Y, Z, **stat_kwargs) -> float
+    Bundle_X_gen, Bundle_Y_gen : DataBundle
+        Generated conditional samples with shape starting ``(n, M, ...)``.
 
-    stat_kwargs : dict, optional
-        Extra keyword arguments passed to stat_fn.
+    atol : float, default=1e-12
+        Numerical tolerance used in distance comparisons.
+
+    batch_size : int, default=1024
+        Number of ordered pairs ``(i, j)`` processed per batch.
+
+    Returns
+    -------
+    T_obs : float
+        Observed statistic.
+
+    backend_info : dict
+        Backend metadata, including backend, dtype, and batch size.
+
+    distance_dict : dict
+        Precomputed distance arrays/tensors.
+
+    emdf_I_info : dict
+        Cached reusable terms for permutation statistics.
+    """
+
+    X_data = Bundle_X.data
+    n = X_data.shape[0]
+    M = Bundle_X_gen.data.shape[1]
+
+    if isinstance(X_data, torch.Tensor):
+        backend_info = {
+            "backend": "torch",
+            "device": X_data.device,
+            "dtype": X_data.dtype,
+            "batch_size": batch_size,
+        }
+    elif isinstance(X_data, np.ndarray):
+        backend_info = {
+            "backend": "numpy",
+            "dtype": X_data.dtype,
+            "batch_size": batch_size,
+        }
+    else:
+        raise TypeError("Bundle_X.data must be np.ndarray or torch.Tensor.")
+
+    distance_dict = {
+        "d_x": compute_distance(
+            broadcast_pair_array(_main_left(Bundle_X), mode="ij"),
+            broadcast_pair_array(_main_right(Bundle_X), mode="ji"),
+            space_type=Bundle_X.space_type,
+        ),
+        "d_y": compute_distance(
+            broadcast_pair_array(_main_left(Bundle_Y), mode="ij"),
+            broadcast_pair_array(_main_right(Bundle_Y), mode="ji"),
+            space_type=Bundle_Y.space_type,
+        ),
+        "d_z": compute_distance(
+            broadcast_pair_array(_main_left(Bundle_Z), mode="ij"),
+            broadcast_pair_array(_main_right(Bundle_Z), mode="ji"),
+            space_type=Bundle_Z.space_type,
+        ),
+        "d_x_sim": compute_distance(
+            broadcast_pair_array(_main_left(Bundle_X), mode="ijm", rep=M),
+            broadcast_pair_array(_main_right(Bundle_X_gen), mode="jim"),
+            space_type=Bundle_X.space_type,
+        ),
+        "d_y_sim": compute_distance(
+            broadcast_pair_array(_main_left(Bundle_Y), mode="ijm", rep=M),
+            broadcast_pair_array(_main_right(Bundle_Y_gen), mode="jim"),
+            space_type=Bundle_Y.space_type,
+        ),
+    }
+
+    total_pairs = n * (n - 1)
+    total = 0.0
+
+    if backend_info["backend"] == "torch":
+
+        tx_cache = torch.empty(
+            (total_pairs, n),
+            device=backend_info["device"],
+            dtype=backend_info["dtype"],
+        )
+        dz_cache = torch.empty(
+            (total_pairs, n),
+            device=backend_info["device"],
+            dtype=backend_info["dtype"],
+        )
+
+        for start in range(0, total_pairs, batch_size):
+            end = min(start + batch_size, total_pairs)
+
+            k = torch.arange(
+                start,
+                end,
+                device=backend_info["device"],
+                dtype=torch.long,
+            )
+            ib = torch.div(k, n - 1, rounding_mode="floor")
+            r = torch.remainder(k, n - 1)
+            jb = r + (r >= ib).to(torch.long)
+
+            dx_ij = distance_dict["d_x"][ib, jb]
+            dy_ij = distance_dict["d_y"][ib, jb]
+            dz_ij = distance_dict["d_z"][ib, jb]
+
+            emdf_P = (
+                (distance_dict["d_x"][ib, :] <= dx_ij[:, None] + atol)
+                & (distance_dict["d_y"][ib, :] <= dy_ij[:, None] + atol)
+                & (distance_dict["d_z"][ib, :] <= dz_ij[:, None] + atol)
+            ).to(backend_info["dtype"]).mean(dim=1)
+
+            tx = (
+                distance_dict["d_x_sim"][ib, :, :]
+                <= dx_ij[:, None, None] + atol
+            ).to(backend_info["dtype"]).mean(dim=2)
+
+            ty = (
+                distance_dict["d_y_sim"][ib, :, :]
+                <= dy_ij[:, None, None] + atol
+            ).to(backend_info["dtype"]).mean(dim=2)
+
+            dz = (
+                distance_dict["d_z"][ib, :]
+                <= dz_ij[:, None] + atol
+            ).to(backend_info["dtype"])
+
+            tx_cache[start:end, :] = tx
+            dz_cache[start:end, :] = dz
+
+            emdf_I = (tx * ty * dz).mean(dim=1)
+
+            diff = emdf_P - emdf_I
+            total += float((diff * diff).sum().item())
+
+    else:
+
+        tx_cache = np.empty(
+            (total_pairs, n),
+            dtype=backend_info["dtype"],
+        )
+        dz_cache = np.empty(
+            (total_pairs, n),
+            dtype=backend_info["dtype"],
+        )
+
+        for start in range(0, total_pairs, batch_size):
+            end = min(start + batch_size, total_pairs)
+
+            k = np.arange(start, end, dtype=np.int64)
+            ib = k // (n - 1)
+            r = k % (n - 1)
+            jb = r + (r >= ib)
+
+            dx_ij = distance_dict["d_x"][ib, jb]
+            dy_ij = distance_dict["d_y"][ib, jb]
+            dz_ij = distance_dict["d_z"][ib, jb]
+
+            emdf_P = (
+                (distance_dict["d_x"][ib, :] <= dx_ij[:, None] + atol)
+                & (distance_dict["d_y"][ib, :] <= dy_ij[:, None] + atol)
+                & (distance_dict["d_z"][ib, :] <= dz_ij[:, None] + atol)
+            ).astype(backend_info["dtype"]).mean(axis=1)
+
+            tx = (
+                distance_dict["d_x_sim"][ib, :, :]
+                <= dx_ij[:, None, None] + atol
+            ).astype(backend_info["dtype"]).mean(axis=2)
+
+            ty = (
+                distance_dict["d_y_sim"][ib, :, :]
+                <= dy_ij[:, None, None] + atol
+            ).astype(backend_info["dtype"]).mean(axis=2)
+
+            dz = (
+                distance_dict["d_z"][ib, :]
+                <= dz_ij[:, None] + atol
+            ).astype(backend_info["dtype"])
+
+            tx_cache[start:end, :] = tx
+            dz_cache[start:end, :] = dz
+
+            emdf_I = (tx * ty * dz).mean(axis=1)
+
+            diff = emdf_P - emdf_I
+            total += float(np.sum(diff * diff))
+
+    emdf_I_info = {
+        "tx_cache": tx_cache,
+        "dz_cache": dz_cache,
+    }
+
+    return total / total_pairs, backend_info, distance_dict, emdf_I_info
+
+
+def statistics_perm(
+    backend_info: dict,
+    distance_dict: dict,
+    emdf_I_info: dict,
+    perm_index,
+    atol: float = 1e-12,
+) -> float:
+    r"""
+    Compute the statistic for one local permutation of Y.
+
+    Parameters
+    ----------
+    backend_info : dict
+        Backend metadata returned by ``statistics_obs``.
+
+    distance_dict : dict
+        Precomputed distance arrays/tensors returned by ``statistics_obs``.
+
+    emdf_I_info : dict
+        Cached reusable terms returned by ``statistics_obs``.
+
+    perm_index : np.ndarray or torch.Tensor
+        Local permutation indices of shape ``(n,)``.
+
+    atol : float, default=1e-12
+        Numerical tolerance used in distance comparisons.
+
+    Returns
+    -------
+    float
+        Permutation statistic.
+    """
+
+    d_x = distance_dict["d_x"]
+    d_y = distance_dict["d_y"]
+    d_z = distance_dict["d_z"]
+    d_y_sim = distance_dict["d_y_sim"]
+
+    tx_cache = emdf_I_info["tx_cache"]
+    dz_cache = emdf_I_info["dz_cache"]
+
+    batch_size = backend_info["batch_size"]
+
+    n = d_x.shape[0]
+    total_pairs = n * (n - 1)
+    total = 0.0
+
+    if backend_info["backend"] == "torch":
+
+        device = backend_info["device"]
+        dtype = backend_info["dtype"]
+
+        if not isinstance(perm_index, torch.Tensor):
+            perm_index = torch.as_tensor(
+                perm_index,
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            perm_index = perm_index.to(device=device, dtype=torch.long)
+
+        d_y_perm = d_y[perm_index][:, perm_index]
+        d_y_sim_perm = d_y_sim[perm_index, :, :]
+
+        for start in range(0, total_pairs, batch_size):
+            end = min(start + batch_size, total_pairs)
+
+            k = torch.arange(start, end, device=device, dtype=torch.long)
+            ib = torch.div(k, n - 1, rounding_mode="floor")
+            r = torch.remainder(k, n - 1)
+            jb = r + (r >= ib).to(torch.long)
+
+            dx_ij = d_x[ib, jb]
+            dy_ij = d_y_perm[ib, jb]
+            dz_ij = d_z[ib, jb]
+
+            emdf_P = (
+                (d_x[ib, :] <= dx_ij[:, None] + atol)
+                & (d_y_perm[ib, :] <= dy_ij[:, None] + atol)
+                & (d_z[ib, :] <= dz_ij[:, None] + atol)
+            ).to(dtype).mean(dim=1)
+
+            tx = tx_cache[start:end, :]
+            dz = dz_cache[start:end, :]
+
+            ty = (
+                d_y_sim_perm[ib, :, :]
+                <= dy_ij[:, None, None] + atol
+            ).to(dtype).mean(dim=2)
+
+            emdf_I = (tx * ty * dz).mean(dim=1)
+
+            diff = emdf_P - emdf_I
+            total += float((diff * diff).sum().item())
+
+        return total / total_pairs
+
+    dtype = backend_info["dtype"]
+    perm_index = np.asarray(perm_index, dtype=np.int64)
+
+    d_y_perm = d_y[np.ix_(perm_index, perm_index)]
+    d_y_sim_perm = d_y_sim[perm_index, :, :]
+
+    for start in range(0, total_pairs, batch_size):
+        end = min(start + batch_size, total_pairs)
+
+        k = np.arange(start, end, dtype=np.int64)
+        ib = k // (n - 1)
+        r = k % (n - 1)
+        jb = r + (r >= ib)
+
+        dx_ij = d_x[ib, jb]
+        dy_ij = d_y_perm[ib, jb]
+        dz_ij = d_z[ib, jb]
+
+        emdf_P = (
+            (d_x[ib, :] <= dx_ij[:, None] + atol)
+            & (d_y_perm[ib, :] <= dy_ij[:, None] + atol)
+            & (d_z[ib, :] <= dz_ij[:, None] + atol)
+        ).astype(dtype).mean(axis=1)
+
+        tx = tx_cache[start:end, :]
+        dz = dz_cache[start:end, :]
+
+        ty = (
+            d_y_sim_perm[ib, :, :]
+            <= dy_ij[:, None, None] + atol
+        ).astype(dtype).mean(axis=2)
+
+        emdf_I = (tx * ty * dz).mean(axis=1)
+
+        diff = emdf_P - emdf_I
+        total += float(np.sum(diff * diff))
+
+    return total / total_pairs
+
+
+def local_permutation_test_opt(
+    Bundle_X: DataBundle,
+    Bundle_Y: DataBundle,
+    Bundle_Z: DataBundle,
+    stat_kwargs: Optional[Dict] = None,
+    B: int = 500,
+    k: Optional[int] = None,
+    permutation_strategy: str = "resample",
+    alpha: float = 0.05,
+    generator: np.random.Generator | torch.Generator | None = None,
+    show_progress: bool = False,
+    knn_batch_size: int | None = None,
+) -> Dict[str, object]:
+    r"""
+    Perform the optimized local permutation test.
+
+    Parameters
+    ----------
+    Bundle_X, Bundle_Y, Bundle_Z : DataBundle
+        Observed data bundles with shared first dimension ``n``.
+
+    stat_kwargs : dict or None, default=None
+        Keyword arguments passed to ``statistics_obs``.
+        Should include generated bundles such as ``Bundle_X_gen`` and
+        ``Bundle_Y_gen``.
 
     B : int, default=500
-        Number of local permutation replicates.
+        Number of permutation replicates.
 
-    k : int, optional
-        Neighborhood size. If None, use max(10, ceil(sqrt(n))).
+    k : int or None, default=None
+        Neighborhood size. If ``None``, uses ``max(10, ceil(sqrt(n)))``.
 
-    z_space_type : str, default="euclidean"
-        One of {"euclidean", "sphere", "spd"}.
-
-    permutation_strategy : str, default="resample"
-        One of {"resample", "shuffle_once"}.
+    permutation_strategy : {"resample", "shuffle_once"}, default="resample"
+        Strategy used to generate local permutation indices.
 
     alpha : float, default=0.05
         Significance level.
 
-    seed : int, optional
-        Random seed.
+    generator : np.random.Generator, torch.Generator, or None, default=None
+        Random number generator matching the backend.
 
     show_progress : bool, default=False
-        Whether to display a tqdm progress bar for the permutation loop.
+        Whether to show a progress bar.
+
+    knn_batch_size : int or None, default=None
+        Batch size used when computing KNN distances.
 
     Returns
     -------
-    result : dict
-        {
-            "T_obs": float,
-            "T_perm": np.ndarray of shape (B,),
-            "p_value": float,
-            "reject": bool,
-            "k": int,
-            "knn_indices": np.ndarray
-        }
+    dict
+        Test result containing ``T_obs``, ``T_perm``, ``p_value``,
+        ``reject``, ``k``, and ``knn_indices``.
     """
-
-    start = time.time()
 
     if stat_kwargs is None:
         stat_kwargs = {}
 
-    rng = np.random.default_rng(seed)
-    n = len(Z)
+    # ============================================================
+    # Basic checks
+    # ============================================================
+
+    if not isinstance(Bundle_X, DataBundle):
+        raise TypeError("Bundle_X must be a DataBundle.")
+    if not isinstance(Bundle_Y, DataBundle):
+        raise TypeError("Bundle_Y must be a DataBundle.")
+    if not isinstance(Bundle_Z, DataBundle):
+        raise TypeError("Bundle_Z must be a DataBundle.")
+
+    n = Bundle_Z.data.shape[0]
+
+    if Bundle_X.data.shape[0] != n or Bundle_Y.data.shape[0] != n:
+        raise ValueError(
+            "Bundle_X, Bundle_Y, and Bundle_Z must have the same sample size."
+        )
+
+    if n < 2:
+        raise ValueError("At least two observations are required.")
+
+    if B <= 0:
+        raise ValueError("B must be positive.")
 
     if k is None:
-        k = max(10, int(np.ceil(np.sqrt(n))))
+        k = max(10, int(np.ceil(np.sqrt(float(n)))))
 
-    # 与 build_knn_indices 的约束保持一致
     if k >= n:
         k = n - 1
 
+    if k < 1:
+        raise ValueError("k must be at least 1 after adjustment.")
+
+    Z_data = Bundle_Z.data
+
+    # ============================================================
+    # Backend setup
+    # ============================================================
+
+    if isinstance(Z_data, torch.Tensor):
+
+        device = Z_data.device
+        dtype = Z_data.dtype
+
+        if generator is None:
+            generator = torch.Generator(device=device)
+        elif not isinstance(generator, torch.Generator):
+            raise TypeError(
+                "For torch backend, generator must be torch.Generator or None."
+            )
+
+        T_perm = torch.empty(
+            (B,),
+            device=device,
+            dtype=dtype,
+        )
+
+    elif isinstance(Z_data, np.ndarray):
+
+        dtype = Z_data.dtype
+
+        if generator is None:
+            generator = np.random.default_rng()
+        elif not isinstance(generator, np.random.Generator):
+            raise TypeError(
+                "For NumPy backend, generator must be np.random.Generator or None."
+            )
+
+        T_perm = np.empty(
+            (B,),
+            dtype=dtype,
+        )
+
+    else:
+        raise TypeError("Bundle_Z.data must be np.ndarray or torch.Tensor.")
+
+    # ============================================================
+    # KNN construction
+    # ============================================================
+
     knn_indices = build_knn_indices(
-        Z=Z,
+        Bundle_Z=Bundle_Z,
         k=k,
-        z_space_type=z_space_type,
         include_self=False,
+        batch_size=knn_batch_size,
     )
 
-    T_start = time.time()
-    T_obs = stat_fn(X, Y, Z, **stat_kwargs)
-    T_end = time.time()
-    T_elapsed = T_end - T_start
-    permutation_elapsed = 0.0
+    # ============================================================
+    # Observed statistic and reusable cache
+    # ============================================================
 
-    T_perm = np.zeros(B, dtype=float)
+    T_obs, backend_info, distance_dict, emdf_I_info = statistics_obs(
+        Bundle_X=Bundle_X,
+        Bundle_Y=Bundle_Y,
+        Bundle_Z=Bundle_Z,
+        **stat_kwargs,
+    )
+
+    T_obs_float = (
+        float(T_obs.item())
+        if isinstance(T_obs, torch.Tensor)
+        else float(T_obs)
+    )
+
+    # ============================================================
+    # Permutation statistics
+    # ============================================================
 
     iterator = range(B)
     if show_progress:
@@ -1287,35 +1721,49 @@ def local_permutation_test_time(
         iterator = tqdm(iterator, desc="Permutation", leave=False)
 
     for b in iterator:
-        permutation_start = time.time()
-        Y_star = local_permute_y(
-            Y=Y,
+
+        perm_index = local_permute_y(
+            Bundle_Y=Bundle_Y,
             knn_indices=knn_indices,
-            rng=rng,
+            generator=generator,
             strategy=permutation_strategy,
         )
-        permutation_end = time.time()
-        permutation_elapsed = permutation_end - permutation_start
-        T_start = time.time()
-        T_perm[b] = stat_fn(X, Y_star, Z, **stat_kwargs)
-        T_end = time.time()
-        T_elapsed += T_end - T_start
-        permutation_elapsed += permutation_end - permutation_start
 
-    p_value = (1.0 + np.sum(T_perm >= T_obs)) / (B + 1.0)
+        Tb = statistics_perm(
+            backend_info=backend_info,
+            distance_dict=distance_dict,
+            emdf_I_info=emdf_I_info,
+            perm_index=perm_index,
+        )
 
-    end = time.time()
-    elapsed = end - start
-    print(f"Local permutation test completed in {elapsed:.2f} seconds.")
-    print(f"Total time for statistic computation: {T_elapsed:.2f} seconds.")
-    print(f"Total time for permutation: {permutation_elapsed:.2f} seconds.")
+        if isinstance(T_perm, torch.Tensor):
+            T_perm[b] = float(Tb)
+        else:
+            T_perm[b] = float(Tb)
+
+    # ============================================================
+    # P-value
+    # ============================================================
+
+    if isinstance(T_perm, torch.Tensor):
+
+        p_value_tensor = (
+            1.0 + torch.sum(T_perm >= T_obs_float).to(dtype=dtype)
+        ) / (B + 1.0)
+
+        p_value = float(p_value_tensor.item())
+
+    else:
+
+        p_value = float(
+            (1.0 + np.sum(T_perm >= T_obs_float)) / (B + 1.0)
+        )
 
     return {
-        "T_obs": float(T_obs),
+        "T_obs": T_obs_float,
         "T_perm": T_perm,
-        "p_value": float(p_value),
+        "p_value": p_value,
         "reject": bool(p_value <= alpha),
         "k": int(k),
         "knn_indices": knn_indices,
     }
-
