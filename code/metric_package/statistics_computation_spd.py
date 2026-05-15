@@ -1,6 +1,5 @@
 import torch
 from dataclasses import dataclass
-import torch
 from typing import Callable, Optional, Dict
 
 
@@ -1018,121 +1017,13 @@ def statistics(
     Bundle_X: SPDDataBundle,
     Bundle_Y: SPDDataBundle,
     Bundle_Z: SPDDataBundle,
-    Bundle_X_orc: SPDDataBundle,
-    Bundle_Y_orc: SPDDataBundle,
-    atol: float = 1e-12,
-    batch_size: int = 1024,
-    chunk_size_xy: int|None = None,
-    chunk_size_z: int|None = None,
-) -> float:
-    r"""
-    Compute the statistic
-
-    .. math::
-        T_n^{\mathrm{gen}}
-        =
-        \frac{1}{n(n-1)}
-        \sum_{i \ne j}
-        \left[
-        \hat F_n^{\mathcal M}(u_i, u_j)
-        -
-        \hat F_n^{M,\perp}(u_i, u_j)
-        \right]^2.
-
-    Parameters
-    ----------
-    Bundle_X, Bundle_Y, Bundle_Z : SPDDataBundle
-        Observed SPD samples for the three components.
-
-        Shape of each ``.matrix``:
-        - ``(n, p, p)``
-
-    Bundle_X_orc, Bundle_Y_orc : SPDDataBundle
-        Conditional generated samples for the ``X`` and ``Y`` components.
-
-        Shape of each ``.matrix``:
-        - ``(n, M, p, p)``
-
-    atol : float, default=1e-12
-        Absolute tolerance used in the indicator comparisons.
-
-    batch_size : int, default=1024
-        Number of ordered pairs ``(i, j)``, ``i \ne j``, processed in each batch.
-
-    Returns
-    -------
-    float
-        Value of the test statistic.
-
-    Notes
-    -----
-    This routine assumes all inputs are represented as ``SPDDataBundle``
-    objects on GPU. The computation over all ordered pairs ``(i, j)``
-    with ``i \ne j`` is carried out in batches for memory efficiency.
-    """
-
-    if Bundle_X.matrix.shape != Bundle_Y.matrix.shape or Bundle_X.matrix.shape != Bundle_Z.matrix.shape:
-        raise ValueError("Bundle_X, Bundle_Y, and Bundle_Z must have identical shapes.")
-
-    n = Bundle_X.matrix.shape[0]
-    if n < 2:
-        raise ValueError("At least two observations are required.")
-
-    if Bundle_X_orc.matrix.shape[0] != n or Bundle_Y_orc.matrix.shape[0] != n:
-        raise ValueError("Bundle_X_orc and Bundle_Y_orc must have leading dimension n matching observed data.")
-
-    Bundle_S = stack_spd_triplet(Bundle_X, Bundle_Y, Bundle_Z)
-
-    total_pairs = n * (n - 1)
-    total = 0.0
-    device = Bundle_X.matrix.device
-
-    for start in range(0, total_pairs, batch_size):
-        end = min(start + batch_size, total_pairs)
-
-        k = torch.arange(start, end, device=device, dtype=torch.long)
-        ib = torch.div(k, n - 1, rounding_mode="floor")
-        r = torch.remainder(k, n - 1)
-        jb = r + (r >= ib).to(torch.long)
-
-        Bundle_u_batch = slice_spd_bundle(Bundle_S, ib)
-        Bundle_v_batch = slice_spd_bundle(Bundle_S, jb)
-
-        emdf_P = emdf_product_pair_batch(
-            Bundle_xyz_samples=Bundle_S,
-            Bundle_u_batch=Bundle_u_batch,
-            Bundle_v_batch=Bundle_v_batch,
-            atol=atol,
-        )
-
-        emdf_I = f_perp_gen_pair_batch(
-            Bundle_u_batch=Bundle_u_batch,
-            Bundle_v_batch=Bundle_v_batch,
-            Bundle_X_orc=Bundle_X_orc,
-            Bundle_Y_orc=Bundle_Y_orc,
-            Bundle_Z=Bundle_Z,
-            atol=atol,
-            chunk_size_xy=chunk_size_xy,
-            chunk_size_z=chunk_size_z,
-        )
-
-        diff = emdf_P - emdf_I
-        total += float((diff * diff).sum().item())
-
-    return total / (n * (n - 1))
-
-
-def statistics_fast(
-    Bundle_X: SPDDataBundle,
-    Bundle_Y: SPDDataBundle,
-    Bundle_Z: SPDDataBundle,
-    Bundle_X_orc: SPDDataBundle,
-    Bundle_Y_orc: SPDDataBundle,
+    Bundle_X_gen: SPDDataBundle,
+    Bundle_Y_gen: SPDDataBundle,
     atol: float = 1e-12,
     batch_size: int = 1024,
 ) -> float:
     n = Bundle_X.matrix.shape[0]
-    M = Bundle_X_orc.matrix.shape[1]
+    M = Bundle_X_gen.matrix.shape[1]
     device = Bundle_X.matrix.device
     dtype = Bundle_X.matrix.dtype
 
@@ -1156,13 +1047,13 @@ def statistics_fast(
 
     d_x_sim = spd_affine_invariant_distance_from_inv_half(
         Bundle_X.inv_half[:, None, None, :, :].expand(n, n, M, -1, -1),
-        Bundle_X_orc.matrix[None, :, :, :, :].expand(n, n, M, -1, -1),
+        Bundle_X_gen.matrix[None, :, :, :, :].expand(n, n, M, -1, -1),
         atol=atol,
     )
 
     d_y_sim = spd_affine_invariant_distance_from_inv_half(
         Bundle_Y.inv_half[:, None, None, :, :].expand(n, n, M, -1, -1),
-        Bundle_Y_orc.matrix[None, :, :, :, :].expand(n, n, M, -1, -1),
+        Bundle_Y_gen.matrix[None, :, :, :, :].expand(n, n, M, -1, -1),
         atol=atol,
     )
 
